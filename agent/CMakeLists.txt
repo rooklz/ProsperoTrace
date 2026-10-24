@@ -25,6 +25,8 @@ add_executable(prosperotrace
     src/target.c
     src/hook.c
     src/trampoline.c
+    src/ring_decode.c
+    src/filter.c
     src/nids.c
     ${CMAKE_BINARY_DIR}/gen/nids_table.c
 )

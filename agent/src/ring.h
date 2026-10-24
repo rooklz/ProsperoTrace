@@ -13,7 +13,7 @@
  * docs/DESIGN.md for the single-writer caveats and the M4 seqlock plan.
  */
 
-#define PT_RING_CAP_EVENTS  63u            /* events per ring (power of two) */
+#define PT_RING_CAP_EVENTS  64u            /* events per ring (power of two) */
 #define PT_RING_MASK        (PT_RING_CAP_EVENTS - 1u)
 #define PT_EVENT_LANES      8u             /* u64 lanes per event */
 #define PT_EVENT_BYTES      (PT_EVENT_LANES * 8u)

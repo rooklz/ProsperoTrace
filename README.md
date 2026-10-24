@@ -23,7 +23,8 @@ Early development. What works today:
 - [x] agent: connect-out streaming with SPSC ring buffer + drop accounting
 - [x] agent: process discovery (`kern.proc` sysctl)
 - [x] agent: trampoline emitter (x86-64, byte-verified against a reference — `tests/check_trampoline.sh`)
-- [x] agent: shared ring transport + reader thread (entry/ret pairing)
+- [x] agent: shared ring transport + decoder with entry/ret pairing (host-tested — `tests/ring_decode_test.c`)
+- [x] agent: hook selection filter (`PT_FILTER`, globs on `mod.fn`; host-tested — `tests/filter_test.c`)
 - [x] agent: PLT/GOT scan + candidate collection
 - [ ] agent: remote page injection glue (`PT_SYSCTRL` map) + GOT write-up — the last step before on-console arming
 - [ ] agent: dynlib module walk (instrument loaded PRXs beyond the main executable)

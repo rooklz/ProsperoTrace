@@ -67,9 +67,10 @@ Two buffers by design:
 
 - **Shared ring** (target→agent). The trampolines write fixed-size events
   (8×u64 lanes per event; entry and ret lane-groups) with plain stores, and
-  the agent reader drains from the same page. No locks — the target bumps
-  `head` per event pair and the reader never races past it. Layout in
-  `agent/src/ring.h`.
+  the reader drains from the same page. No locks — the target bumps `head`
+  per event pair and the reader never races past it. Layout in
+  `agent/src/ring.h`; the entry/ret pairing decoder lives in
+  `agent/src/ring_decode.c` and is host-tested (`tests/ring_decode_test.c`).
 - **Stream ring** (agent→socket). The existing SPSC ring in `stream.c`
   batches events into TCP sends; this is where drops are counted and
   reported as `{"type":"drops"}` records.
@@ -103,8 +104,10 @@ NIDs are logged as `nid_0x…` so coverage gaps are visible in the output.
 
 1. **M1** — streamer, ring buffer, process discovery, host receiver ✅
 2. **M2** — PLT/GOT hooks: trampoline emitter (byte-verified), shared-ring
-   transport with reader thread, candidate scan ✅ — remaining:
-   `PT_SYSCTRL` remote map glue and the GOT write-up on console
-3. **M3** — filter language (module/function globs), detach/reattach
-4. **M4** — inline-detour fallback; per-thread pending events (seqlock); option
-   to follow child processes
+   transport with a decoder (host-tested), candidate scan, glob filter ✅ —
+   remaining: `PT_SYSCTRL` remote map glue, the GOT write-up, and the dynlib
+   handle walk on console
+3. **M3** — filter language: `PT_FILTER` globs on `mod.fn` ✅; detach/reattach
+   and richer patterns still open
+4. **M4** — inline-detour fallback; per-thread slot reservation (seqlock);
+   option to follow child processes

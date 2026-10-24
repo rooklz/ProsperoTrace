@@ -1,6 +1,8 @@
 #include "hook.h"
+#include "filter.h"
 #include "nids.h"
 #include "ring.h"
+#include "ring_decode.h"
 #include "target.h"
 #include "trampoline.h"
 
@@ -69,12 +71,8 @@ struct hook_rec {
 
 static struct hook_rec g_hooks[MAX_HOOKS];
 static int g_hook_count = -1;
-static struct pt_stream *g_stream;
 
 static struct pt_ring *g_ring;          /* agent-side view of the shared ring */
-
-struct pending { int active; struct pt_event ev; };
-static struct pending g_pending[MAX_HOOKS];
 static pthread_t g_reader;
 static int g_reader_run;
 
@@ -165,6 +163,7 @@ static uint64_t nid_of_reloc(pid_t pid, const struct dyninfo *di, const Elf64_Re
 static int hook_module(pid_t pid, uint64_t base)
 {
     struct dyninfo di;
+    int skipped = 0;
     if (read_dynamic(pid, base, &di) != 0)
         return 0;   /* not a dynamic module (no PLT) — skip */
 
@@ -179,6 +178,13 @@ static int hook_module(pid_t pid, uint64_t base)
 
         uint64_t nid = nid_of_reloc(pid, &di, &r);
         const struct nid_entry *e = nid ? nid_lookup(nid) : 0;
+        const char *mod = e ? e->mod : "?";
+        const char *fn = e ? e->fn : "nid_unresolved";
+
+        if (!pt_filter_allows(mod, fn)) {
+            skipped++;
+            continue;
+        }
 
         uint64_t slot = di.pltgot + 24 + i * 8;  /* skip resolver+linkmap */
         uint64_t orig;
@@ -189,7 +195,7 @@ static int hook_module(pid_t pid, uint64_t base)
         h->slot_addr = slot;
         h->original = orig;
         h->nid = nid;
-        snprintf(h->mod, sizeof(h->mod), "%s", e ? e->mod : "?");
+        snprintf(h->mod, sizeof(h->mod), "%s", mod);
         if (e)
             snprintf(h->fn, sizeof(h->fn), "%s", e->fn);
         else
@@ -200,58 +206,35 @@ static int hook_module(pid_t pid, uint64_t base)
         g_hook_count++;
         printf("  hook cand: %-24s 0x%llx\n", h->fn, (unsigned long long)slot);
     }
-    return 0;
+    return skipped;
 }
 
 /* ---- ring service thread -------------------------------------------- */
 
-static void reader_drain(void)
+struct emit_ctx { struct pt_stream *st; };
+
+static void on_pair(uint32_t idx, const uint64_t args[6], uint64_t ret, void *ctx)
 {
-    uint32_t head = g_ring->head;
-    uint32_t tail = g_ring->tail;
-
-    while (tail != head) {
-        uint32_t s = tail & PT_RING_MASK;
-        uint64_t tag = g_ring->slot[s].lane[0];
-        uint32_t kind = pt_tag_kind(tag);
-        uint32_t idx = pt_tag_index(tag);
-
-        if (kind == PT_TAG_ENTRY) {
-            if (idx < MAX_HOOKS) {
-                g_pending[idx].active = 1;
-                g_pending[idx].ev = g_ring->slot[s];
-            }
-        } else if (kind == PT_TAG_RET) {
-            uint32_t ent = (uint32_t)((s - 1) & PT_RING_MASK);
-            /* ret events land in the lane-group right after their entry */
-            if (idx < MAX_HOOKS && g_pending[idx].active) {
-                const struct hook_rec *h = &g_hooks[idx];
-                const struct pt_event *e = &g_pending[idx].ev;
-                uint64_t args[6];
-                for (int a = 0; a < 6; a++)
-                    args[a] = e->lane[1 + a];
-                (void)ent;
-                pt_log_call(g_stream, 0, h->mod, h->fn, h->nid, args,
-                            g_ring->slot[s].lane[7]);
-                g_pending[idx].active = 0;
-            }
-        }
-        tail += 1;
-    }
-    g_ring->tail = tail;
+    if (idx >= (uint32_t)MAX_HOOKS || g_hooks[idx].fn[0] == 0)
+        return;
+    struct emit_ctx *ec = ctx;
+    pt_log_call(ec->st, 0, g_hooks[idx].mod, g_hooks[idx].fn,
+                g_hooks[idx].nid, args, ret);
 }
 
 static void *reader_thread(void *arg)
 {
-    (void)arg;
+    struct emit_ctx *ec = arg;
     while (g_reader_run) {
-        reader_drain();
+        ring_decode(g_ring, on_pair, ec);
         struct timespec ts = { 0, 2000000 };  /* 2 ms */
         nanosleep(&ts, 0);
     }
-    reader_drain();
+    ring_decode(g_ring, on_pair, ec);         /* best-effort final flush */
     return 0;
 }
+
+static struct emit_ctx g_emit_ctx;
 
 /* Remote page injection — the one piece of platform-firmware glue left.
  * PT_SYSCTRL carries the remote-map request the payload wrappers expose.
@@ -270,10 +253,11 @@ static int inject_remote(pid_t pid, const void *local, size_t size, uint64_t *ou
 
 int pt_hooks_install(pid_t pid, struct pt_stream *st)
 {
-    g_stream = st;
+    g_emit_ctx.st = st;
     g_hook_count = 0;
     g_ring = 0;
     g_reader_run = 0;
+    size_t skipped_total = 0;
 
     /* module set: main executable first (M2.1 adds the loaded PRXs) */
     uint64_t bases[MAX_MODULES];
@@ -282,14 +266,18 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
     if (main_base)
         bases[nbases++] = main_base;
 
-    for (size_t i = 0; i < nbases; i++)
-        if (hook_module(pid, bases[i]) != 0) {
+    for (size_t i = 0; i < nbases; i++) {
+        int sk = hook_module(pid, bases[i]);
+        if (sk < 0) {
             pt_hooks_remove(pid);
             return -1;
         }
+        skipped_total += (size_t)sk;
+    }
 
     if (g_hook_count == 0) {
-        printf("prosperotrace: no hook candidates\n");
+        printf("prosperotrace: no hook candidates%s\n",
+               skipped_total ? " (all filtered out)" : "");
         return 0;
     }
 
@@ -340,12 +328,12 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
 
     if (armed) {
         g_reader_run = 1;
-        if (pthread_create(&g_reader, 0, reader_thread, 0) != 0)
+        if (pthread_create(&g_reader, 0, reader_thread, &g_emit_ctx) != 0)
             g_reader_run = 0;
     }
 
-    printf("prosperotrace: %d/%d slots emitted, %lu armed%s\n",
-           (int)emitted, g_hook_count, armed,
+    printf("prosperotrace: %d/%d slots emitted, %lu armed, %zu filtered%s\n",
+           (int)emitted, g_hook_count, armed, skipped_total,
            has_tvm ? "" : " (remote page injection glue pending — see docs/DESIGN.md)");
     return 0;
 }
@@ -367,13 +355,12 @@ int pt_hooks_remove(pid_t pid)
             g_hooks[i].patched = 0;
         }
     }
-    memset(g_pending, 0, sizeof(g_pending));
+    memset(&g_emit_ctx, 0, sizeof(g_emit_ctx));
     if (g_ring) {
         munmap(g_ring, RING_PAGES * 0x1000);
         g_ring = 0;
     }
     g_hook_count = -1;
-    g_stream = 0;
     return rc;
 }
 

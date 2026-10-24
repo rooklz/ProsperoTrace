@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "filter.h"
 #include "hook.h"
 #include "stream.h"
 #include "target.h"
@@ -24,7 +25,15 @@ int main(void)
     const char *name = getenv("PT_NAME");
     const char *pid_s = getenv("PT_PID");
     const char *port_s = getenv("PT_PORT");
+    const char *filt = getenv("PT_FILTER");
     unsigned port = port_s ? (unsigned)strtoul(port_s, 0, 10) : PT_DEFAULT_PORT;
+
+    if (filt && pt_set_filter(filt) != 0) {
+        printf("prosperotrace: bad PT_FILTER\n");
+        return 1;
+    }
+    if (pt_filter_is_set())
+        printf("prosperotrace: filter: %s\n", filt);
 
     if (!host || (!name && !pid_s)) {
         printf("prosperotrace: need PT_HOST and one of PT_PID / PT_NAME\n");
