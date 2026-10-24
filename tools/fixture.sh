@@ -9,9 +9,14 @@
 # its FTP server on 2121 (for /data/prosperotrace.conf), and a checkout of
 # rooklz/prospero-analytics for the receiver and tracediff.
 #
+# Each capture is checked against prospero-analytics' EVENT_FORMAT.md
+# (host/validate.py). With FIXTURE_OUT set, the capture, a tracedb database
+# and the dashboard are left there.
+#
 # Exit 0 when the captured API surface matches the baseline (same functions;
-# rate changes are reported, not fatal), 1 when functions surfaced or went
-# away, 2 when the run itself failed. --update replaces the baseline.
+# rate changes are reported, not fatal), 1 when the format is broken or
+# functions surfaced or went away, 2 when the run itself failed. --update
+# replaces the baseline.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -81,6 +86,17 @@ CALLS=$(grep -c '"type":"call"' "$CAPTURE" || true)
 [ "$CALLS" -gt 0 ] || die "capture has no call events (see agent log above)"
 echo ">> captured $CALLS calls"
 
+# the agent/host contract: a format change on either side fails here
+python3 "$ANALYTICS/host/validate.py" "$CAPTURE" || { echo "fixture: capture breaks EVENT_FORMAT.md"; exit 1; }
+
+OUT="${FIXTURE_OUT:-}"
+if [ -n "$OUT" ]; then
+    cp "$CAPTURE" "$OUT/"
+    python3 "$ANALYTICS/host/tracedb.py" import "$OUT/fixture.db" "$CAPTURE" > /dev/null
+    python3 "$ANALYTICS/host/dashboard.py" "$OUT/fixture.db" -o "$OUT/fixture.html" > /dev/null
+    echo ">> capture, database and dashboard in $OUT"
+fi
+
 if [ "$UPDATE" = 1 ] || [ ! -f "$BASELINE" ]; then
     mkdir -p "$(dirname "$BASELINE")"
     cp "$CAPTURE" "$BASELINE"
@@ -90,7 +106,6 @@ fi
 
 python3 "$ANALYTICS/host/tracediff.py" "$BASELINE" "$CAPTURE" --normalize --json "$WORK/diff.json" \
     | grep -v '^\[json\]'
-cp "$CAPTURE" "${FIXTURE_OUT:-$WORK}/" 2>/dev/null || true
 python3 - "$WORK/diff.json" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))

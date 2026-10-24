@@ -103,8 +103,12 @@ tools/fixture.sh --update                                      # re-record it
 
 Exits 1 if a function surfaced or disappeared compared to
 `tests/fixtures/ptdemo-baseline.jsonl`; rate changes are printed per 1000
-calls. `.github/workflows/fixture.yml` runs the same on a self-hosted runner
-labelled `ps5`.
+calls. Every capture is also validated against prospero-analytics'
+`docs/EVENT_FORMAT.md`, so a format change on either side fails the
+fixture. `.github/workflows/fixture.yml` runs it on the self-hosted `ps5`
+runner and publishes the capture, its `tracedb` database and the dashboard
+as the `fixture` artifact. For tracing anything else, see the end-to-end
+guide: [prospero-analytics/docs/GUIDE.md](https://github.com/rooklz/prospero-analytics/blob/main/docs/GUIDE.md).
 
 ## Event format
 

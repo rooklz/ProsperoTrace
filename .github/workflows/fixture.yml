@@ -26,6 +26,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: capture
-          path: ${{ runner.temp }}/trace-*.jsonl
+          name: fixture
+          path: |
+            ${{ runner.temp }}/trace-*.jsonl
+            ${{ runner.temp }}/fixture.db
+            ${{ runner.temp }}/fixture.html
           if-no-files-found: ignore
