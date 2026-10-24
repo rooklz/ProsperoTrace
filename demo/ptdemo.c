@@ -99,11 +99,11 @@ int main(void)
     }
     unlink("/data/ptdemo.tmp");
     unlink("/data/ptdemo.pid");
-    sleep(1);       /* let the tracer drain its ring before the process goes */
     log = fopen("/data/ptdemo.log", "a");
     if (log) {
         fprintf(log, "ptdemo done\n");
         fclose(log);
     }
+    sleep(1);       /* let the tracer drain its ring before the process goes */
     return 0;
 }
