@@ -1,0 +1,13 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  host-checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rosetta (runs the x86-64 trampoline test on Apple silicon)
+        run: softwareupdate --install-rosetta --agree-to-license || true
+      - run: tests/run.sh

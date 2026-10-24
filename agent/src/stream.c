@@ -165,3 +165,8 @@ void pt_log_hello(struct pt_stream *s, int pid, const char *title, const char *f
     if (n > 0)
         send_all(s->fd, line, (size_t)n);
 }
+
+void pt_log_drops(struct pt_stream *s, uint32_t n)
+{
+    atomic_fetch_add_explicit(&s->dropped, n, memory_order_relaxed);
+}

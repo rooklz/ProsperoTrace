@@ -1,4 +1,5 @@
 #include "hook.h"
+#include "stream.h"
 #include "filter.h"
 #include "nids.h"
 #include "ring.h"
@@ -14,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <ps5/kernel.h>
 
 /* ELF64 definitions needed locally (toolchain headers vary on these) */
 typedef struct {
@@ -33,20 +35,25 @@ typedef struct {
 
 typedef struct { int64_t d_tag; union { uint64_t d_val, d_ptr; } d_un; } Elf64_Dyn;
 typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
-typedef struct { uint64_t st_name; uint8_t st_info, st_other; uint16_t st_shndx; uint64_t st_value, st_size; } Elf64_Sym;
+typedef struct { uint32_t st_name; uint8_t st_info, st_other; uint16_t st_shndx; uint64_t st_value, st_size; } Elf64_Sym;
 
 #define PT_DYNAMIC  2
 #define DT_NULL     0
+#define DT_NEEDED   1
 #define DT_PLTRELSZ 2
 #define DT_PLTGOT   3
 #define DT_STRTAB   5
 #define DT_SYMTAB   6
+#define DT_RELA     7
+#define DT_RELASZ   8
 #define DT_RELAENT  9
 #define DT_JMPREL   23
 
 #define ELF64_R_SYM(i)      ((i) >> 32)
 #define ELF64_R_TYPE(i)     ((i) & 0xffffffff)
+#define R_X86_64_GLOB_DAT   6
 #define R_X86_64_JUMP_SLOT  7
+#define STT_OBJECT          1
 
 #define ELFMAG   "\177ELF"
 #define SELFMAG  4
@@ -72,18 +79,46 @@ struct hook_rec {
 static struct hook_rec g_hooks[MAX_HOOKS];
 static int g_hook_count = -1;
 
-static struct pt_ring *g_ring;          /* agent-side view of the shared ring */
+static struct pt_ring *g_ring;          /* agent-side snapshot of the shared ring */
+static uint64_t g_ring_tva;             /* the ring inside the target */
+static pid_t g_pid;
 static pthread_t g_reader;
 static int g_reader_run;
+static uint64_t g_main_base, g_main_dyn;
 
-/* module enumeration: platform's dynamic linker keeps per-process metadata
- * behind libkernel's dynlib helpers. Resolved the way other payloads do it —
- * handle 0 is the main executable; the loaded PRX set follows (M2.1). */
-static uint64_t module_base(pid_t pid, int handle)
+void pt_hooks_set_base(uint64_t base, uint64_t dynamic)
 {
-    (void)pid;
-    (void)handle;
-    return 0;   /* glue: dynlib handle -> ELF base; see docs/DESIGN.md */
+    g_main_base = base;
+    g_main_dyn = dynamic;
+}
+
+/* Main executable base: given by the caller (elfldr payloads are not in the
+ * dynlib list), else the eboot the platform loader mapped. */
+static uint64_t module_base(pid_t pid)
+{
+    if (g_main_base)
+        return g_main_base;
+    uint32_t h;
+    if (kernel_dynlib_handle(pid, "eboot.bin", &h) != 0)
+        return 0;
+    return (uint64_t)kernel_dynlib_mapbase_addr(pid, h);
+}
+
+/* Calls a trampoline cannot wrap: they return twice, never return, or
+ * switch stacks, and the wrapper's frame would be left dangling. */
+static int never_hook(const char *fn)
+{
+    static const char *deny[] = {
+        "setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "longjmp", "_longjmp",
+        "siglongjmp", "fork", "vfork", "rfork", "getcontext", "setcontext",
+        "swapcontext", "makecontext", "exit", "_exit", "abort", "pthread_exit",
+        "__cxa_throw", "__cxa_rethrow", "_Unwind_RaiseException", "_Unwind_Resume",
+        "sceKernelSetjmp", "sceKernelLongjmp",
+    };
+    for (size_t i = 0; i < sizeof(deny) / sizeof(deny[0]); i++)
+        if (strcmp(fn, deny[i]) == 0)
+            return 1;
+    return 0;
 }
 
 /* ---- target memory helpers with validation ----------------------- */
@@ -99,22 +134,32 @@ static int read_or_fail(pid_t pid, uint64_t addr, void *buf, size_t len, const c
 
 /* ---- ELF/dynamic parsing ------------------------------------------- */
 
+#define MAX_NEEDED 32
+
 struct dyninfo {
+    uint64_t needed[MAX_NEEDED];    /* strtab offsets of DT_NEEDED names */
+    int nneeded;
     uint64_t jmprel;
     uint64_t pltrelsz;
+    uint64_t rela;
+    uint64_t relasz;
     uint64_t pltgot;
     uint64_t strtab;
     uint64_t symtab;
     uint64_t relaent;
 };
 
-static int read_dynamic(pid_t pid, uint64_t base, struct dyninfo *di)
+static int read_dynamic(pid_t pid, uint64_t base, uint64_t dyn_addr, struct dyninfo *di)
 {
+    if (dyn_addr)
+        goto have_dynamic;      /* loader did not map the headers (elfldr) */
     Elf64_Ehdr eh;
     if (read_or_fail(pid, base, &eh, sizeof(eh), "ehdr") != 0)
         return -1;
-    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0)
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) {
+        printf("prosperotrace: no ELF header at 0x%llx\n", (unsigned long long)base);
         return -1;
+    }
 
     Elf64_Phdr ph[16];
     if (eh.e_phnum > 16)
@@ -122,13 +167,15 @@ static int read_dynamic(pid_t pid, uint64_t base, struct dyninfo *di)
     if (read_or_fail(pid, base + eh.e_phoff, ph, eh.e_phnum * sizeof(Elf64_Phdr), "phdr") != 0)
         return -1;
 
-    uint64_t dyn_addr = 0;
     for (int i = 0; i < eh.e_phnum; i++)
         if (ph[i].p_type == PT_DYNAMIC)
             dyn_addr = base + ph[i].p_vaddr;
-    if (!dyn_addr)
+    if (!dyn_addr) {
+        printf("prosperotrace: no PT_DYNAMIC at 0x%llx\n", (unsigned long long)base);
         return -1;
+    }
 
+have_dynamic:
     memset(di, 0, sizeof(*di));
     di->relaent = sizeof(Elf64_Rela);
     for (;;) {
@@ -139,73 +186,146 @@ static int read_dynamic(pid_t pid, uint64_t base, struct dyninfo *di)
         if (d.d_tag == DT_NULL)
             break;
         switch (d.d_tag) {
+        case DT_NEEDED:   if (di->nneeded < MAX_NEEDED) di->needed[di->nneeded++] = d.d_un.d_val; break;
         case DT_JMPREL:   di->jmprel   = base + d.d_un.d_ptr; break;
         case DT_PLTRELSZ: di->pltrelsz = d.d_un.d_val;        break;
         case DT_PLTGOT:   di->pltgot   = base + d.d_un.d_ptr; break;
         case DT_STRTAB:   di->strtab   = base + d.d_un.d_ptr; break;
         case DT_SYMTAB:   di->symtab   = base + d.d_un.d_ptr; break;
+        case DT_RELA:     di->rela     = base + d.d_un.d_ptr; break;
+        case DT_RELASZ:   di->relasz   = d.d_un.d_val;        break;
+        case DT_RELAENT:  if (d.d_un.d_val) di->relaent = d.d_un.d_val; break;
         }
     }
-    return (di->jmprel && di->pltrelsz && di->pltgot) ? 0 : -1;
-}
-
-/* The platform names imports by NID: each JUMP_SLOT symbol carries the NID
- * in st_name under Sony's extended info scheme. */
-static uint64_t nid_of_reloc(pid_t pid, const struct dyninfo *di, const Elf64_Rela *r)
-{
-    Elf64_Sym sym;
-    uint64_t sym_addr = di->symtab + ELF64_R_SYM(r->r_info) * sizeof(sym);
-    if (pt_read(pid, sym_addr, &sym, sizeof(sym)) != 0)
+    if (di->symtab && di->strtab && ((di->jmprel && di->pltrelsz) || (di->rela && di->relasz)))
         return 0;
-    return sym.st_name;
+    printf("prosperotrace: dynamic section lacks relocations (symtab %d strtab %d jmprel %d rela %d)\n",
+           !!di->symtab, !!di->strtab, !!di->jmprel, !!di->rela);
+    return -1;
 }
 
-static int hook_module(pid_t pid, uint64_t base)
+/* One import slot. Retail modules name imports by NID string; payloads
+ * built with ps5-payload-sdk use plain names, which elfldr resolves. */
+static int hook_reloc(pid_t pid, uint64_t base, const struct dyninfo *di, const Elf64_Rela *r)
+{
+    uint32_t type = (uint32_t)ELF64_R_TYPE(r->r_info);
+    if (type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT)
+        return 0;
+    Elf64_Sym sym;
+    if (pt_read(pid, di->symtab + ELF64_R_SYM(r->r_info) * sizeof(sym), &sym, sizeof(sym)) != 0)
+        return -1;
+    if ((sym.st_info & 0xf) == STT_OBJECT || sym.st_shndx != 0)
+        return 0;                             /* data, or defined locally */
+    char name[64];
+    if (pt_read(pid, di->strtab + sym.st_name, name, sizeof(name)) != 0)
+        return -1;
+    name[sizeof(name) - 1] = 0;
+    char *hash = strchr(name, '#');
+    if (hash)
+        *hash = 0;                            /* NID#lib#module suffix */
+    if (!name[0] || never_hook(name))
+        return 0;
+
+    const struct nid_entry *e = nid_lookup_name(name);
+    const char *mod = e ? e->mod : "?";   /* filtered once modules are known */
+
+    uint64_t slot = base + r->r_offset;
+    uint64_t orig;
+    if (pt_read(pid, slot, &orig, sizeof(orig)) != 0)
+        return -1;
+    if (!orig)
+        return 0;                             /* unresolved weak import */
+
+    struct hook_rec *h = &g_hooks[g_hook_count++];
+    memset(h, 0, sizeof(*h));
+    h->slot_addr = slot;
+    h->original = orig;
+    h->nid = e ? e->nid : 0;
+    snprintf(h->mod, sizeof(h->mod), "%s", mod);
+    snprintf(h->fn, sizeof(h->fn), "%s", name);
+    return 0;
+}
+
+static int hook_table(pid_t pid, uint64_t base, const struct dyninfo *di,
+                      uint64_t table, uint64_t size)
+{
+    int skipped = 0;
+    for (uint64_t off = 0; table && off + sizeof(Elf64_Rela) <= size && g_hook_count < MAX_HOOKS;
+         off += di->relaent) {
+        Elf64_Rela r;
+        if (pt_read(pid, table + off, &r, sizeof(r)) != 0)
+            return -1;
+        int rc = hook_reloc(pid, base, di, &r);
+        if (rc < 0)
+            return -1;
+        skipped += rc;
+    }
+    return skipped;
+}
+
+/* Imports named without a NID carry no module. Attribute each to the
+ * DT_NEEDED library whose mapping starts closest below its resolved
+ * address; "libkernel_web.sprx" becomes "libkernel_web". */
+static void attribute_modules(pid_t pid, const struct dyninfo *di, int first)
+{
+    struct { uint64_t base; char name[32]; } libs[MAX_NEEDED];
+    int n = 0;
+    for (int i = 0; i < di->nneeded; i++) {
+        char name[64];
+        uint32_t h;
+        if (pt_read(pid, di->strtab + di->needed[i], name, sizeof(name)) != 0)
+            continue;
+        name[sizeof(name) - 1] = 0;
+        /* libkernel is linked as one of several aliases of the same module */
+        static const char *kernel_alias[] = { "libkernel.sprx", "libkernel_sys.sprx", "libkernel_web.sprx" };
+        int found = kernel_dynlib_handle(pid, name, &h) == 0;
+        for (size_t a = 0; !found && strncmp(name, "libkernel", 9) == 0 && a < 3; a++)
+            found = kernel_dynlib_handle(pid, kernel_alias[a], &h) == 0;
+        if (!found)
+            continue;
+        if (strncmp(name, "libkernel", 9) == 0)
+            snprintf(name, sizeof(name), "libkernel");
+        libs[n].base = (uint64_t)kernel_dynlib_mapbase_addr(pid, h);
+        char *dot = strstr(name, ".sprx");
+        if (dot)
+            *dot = 0;
+        snprintf(libs[n].name, sizeof(libs[n].name), "%s", name);
+        if (libs[n].base)
+            n++;
+    }
+    for (int k = first; k < g_hook_count; k++) {
+        struct hook_rec *h = &g_hooks[k];
+        if (strcmp(h->mod, "?") != 0)
+            continue;
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (libs[i].base <= h->original && (best < 0 || libs[i].base > libs[best].base))
+                best = i;
+        if (best >= 0)
+            snprintf(h->mod, sizeof(h->mod), "%s", libs[best].name);
+    }
+}
+
+static int hook_module(pid_t pid, uint64_t base, uint64_t dyn_addr)
 {
     struct dyninfo di;
-    int skipped = 0;
-    if (read_dynamic(pid, base, &di) != 0)
-        return 0;   /* not a dynamic module (no PLT) — skip */
+    if (read_dynamic(pid, base, dyn_addr, &di) != 0)
+        return 0;   /* not a dynamic module — skip */
+    int first = g_hook_count;
+    int a = hook_table(pid, base, &di, di.jmprel, di.pltrelsz);
+    int b = a < 0 ? -1 : hook_table(pid, base, &di, di.rela, di.relasz);
+    if (b < 0)
+        return -1;
+    attribute_modules(pid, &di, first);
 
-    size_t count = di.pltrelsz / di.relaent;
-    for (size_t i = 0; i < count && g_hook_count < MAX_HOOKS; i++) {
-        Elf64_Rela r;
-        uint64_t raddr = di.jmprel + i * di.relaent;
-        if (pt_read(pid, raddr, &r, sizeof(r)) != 0)
-            return -1;
-        if (ELF64_R_TYPE(r.r_info) != R_X86_64_JUMP_SLOT)
-            continue;
-
-        uint64_t nid = nid_of_reloc(pid, &di, &r);
-        const struct nid_entry *e = nid ? nid_lookup(nid) : 0;
-        const char *mod = e ? e->mod : "?";
-        const char *fn = e ? e->fn : "nid_unresolved";
-
-        if (!pt_filter_allows(mod, fn)) {
-            skipped++;
-            continue;
-        }
-
-        uint64_t slot = di.pltgot + 24 + i * 8;  /* skip resolver+linkmap */
-        uint64_t orig;
-        if (pt_read(pid, slot, &orig, sizeof(orig)) != 0)
-            return -1;
-
-        struct hook_rec *h = &g_hooks[g_hook_count];
-        h->slot_addr = slot;
-        h->original = orig;
-        h->nid = nid;
-        snprintf(h->mod, sizeof(h->mod), "%s", mod);
-        if (e)
-            snprintf(h->fn, sizeof(h->fn), "%s", e->fn);
+    int kept = first, skipped = 0;
+    for (int k = first; k < g_hook_count; k++) {
+        if (pt_filter_allows(g_hooks[k].mod, g_hooks[k].fn))
+            g_hooks[kept++] = g_hooks[k];
         else
-            snprintf(h->fn, sizeof(h->fn), "nid_0x%llx", (unsigned long long)nid);
-        h->code = 0;
-        h->code_target = 0;
-        h->patched = 0;
-        g_hook_count++;
-        printf("  hook cand: %-24s 0x%llx\n", h->fn, (unsigned long long)slot);
+            skipped++;
     }
+    g_hook_count = kept;
     return skipped;
 }
 
@@ -222,31 +342,73 @@ static void on_pair(uint32_t idx, const uint64_t args[6], uint64_t ret, void *ct
                 g_hooks[idx].nid, args, ret);
 }
 
+/* Copy the target's ring into the local snapshot; tail and the drop count
+ * are the reader's own and stay local. */
+static int snapshot_ring(void)
+{
+    uint32_t tail = g_ring->tail, dropped = g_ring->dropped;
+    if (pt_read(g_pid, g_ring_tva, g_ring, PT_RING_SIZE) != 0)
+        return -1;
+    g_ring->tail = tail;
+    g_ring->dropped = dropped;
+    return 0;
+}
+
+#define STALL_POLLS 250     /* x 2 ms: give up on a call blocked this long */
+
 static void *reader_thread(void *arg)
 {
     struct emit_ctx *ec = arg;
+    int stalled = 0;
+    uint32_t last_tail = 0;
     while (g_reader_run) {
-        ring_decode(g_ring, on_pair, ec);
+        if (snapshot_ring() == 0) {
+            ring_decode(g_ring, on_pair, ec, stalled >= STALL_POLLS);
+            if (g_ring->tail == last_tail && (g_ring->head & ~1u) != g_ring->tail)
+                stalled++;
+            else
+                stalled = 0;
+            last_tail = g_ring->tail;
+            if (g_ring->dropped) {
+                pt_log_drops(ec->st, g_ring->dropped);
+                g_ring->dropped = 0;
+            }
+        }
         struct timespec ts = { 0, 2000000 };  /* 2 ms */
         nanosleep(&ts, 0);
     }
-    ring_decode(g_ring, on_pair, ec);         /* best-effort final flush */
+    if (snapshot_ring() == 0)                 /* final flush */
+        ring_decode(g_ring, on_pair, ec, 0);
     return 0;
 }
 
 static struct emit_ctx g_emit_ctx;
 
-/* Remote page injection — the one piece of platform-firmware glue left.
- * PT_SYSCTRL carries the remote-map request the payload wrappers expose.
- * While it returns -1 the install runs in candidates-only mode and the
- * trampolines are emitted and byte-checked but never armed. */
-static int inject_remote(pid_t pid, const void *local, size_t size, uint64_t *out_va)
+/* Map size bytes in the stopped target and copy local into them. The
+ * platform refuses RWX for ordinary processes, so code pages are written
+ * while RW and then flipped to RX with the SDK's kernel_mprotect. */
+static int inject_remote(pid_t pid, const void *local, size_t size, int exec, uint64_t *out_va)
 {
-    (void)pid;
-    (void)local;
-    (void)size;
-    (void)out_va;
-    return -1;
+    uint64_t va = pt_remote_mmap(pid, size, PROT_READ | PROT_WRITE);
+    if (!va) {
+        printf("prosperotrace: remote mmap of %zu bytes failed\n", size);
+        return -1;
+    }
+    if (pt_write(pid, va, local, size) != 0) {
+        printf("prosperotrace: copy into target page 0x%llx failed\n", (unsigned long long)va);
+        return -1;
+    }
+    if (exec) {
+        int want = PROT_READ | PROT_EXEC;
+        if (kernel_mprotect(pid, (intptr_t)va, size, want) != 0 ||
+            (kernel_get_vmem_protection(pid, (intptr_t)va, size) & want) != want) {
+            printf("prosperotrace: could not make 0x%llx executable (prot %d)\n",
+                   (unsigned long long)va, kernel_get_vmem_protection(pid, (intptr_t)va, size));
+            return -1;
+        }
+    }
+    *out_va = va;
+    return 0;
 }
 
 /* ---- public interface ------------------------------------------------ */
@@ -256,20 +418,22 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
     g_emit_ctx.st = st;
     g_hook_count = 0;
     g_ring = 0;
+    g_ring_tva = 0;
+    g_pid = pid;
     g_reader_run = 0;
     size_t skipped_total = 0;
 
     /* module set: main executable first (M2.1 adds the loaded PRXs) */
     uint64_t bases[MAX_MODULES];
     size_t nbases = 0;
-    uint64_t main_base = module_base(pid, 0);
+    uint64_t main_base = module_base(pid);
     if (main_base)
         bases[nbases++] = main_base;
 
     for (size_t i = 0; i < nbases; i++) {
-        int sk = hook_module(pid, bases[i]);
+        int sk = hook_module(pid, bases[i], i == 0 ? g_main_dyn : 0);
         if (sk < 0) {
-            pt_hooks_remove(pid);
+            pt_hooks_remove(pid, 1);
             return -1;
         }
         skipped_total += (size_t)sk;
@@ -303,9 +467,14 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
         return -1;
     }
 
+    for (int i = 0; i < g_hook_count; i++)
+        if (strcmp(g_hooks[i].fn, "getpid") == 0 || strcmp(g_hooks[i].fn, "sceKernelGetpid") == 0)
+            pt_syscall_hint(pid, g_hooks[i].original);
+
+    /* the ring first: the trampolines embed its target address */
     uint64_t ring_tva = 0, code_tva = 0;
-    int has_tvm = (inject_remote(pid, g_ring, RING_PAGES * 0x1000, &ring_tva) == 0) &&
-                  (inject_remote(pid, code, code_pages, &code_tva) == 0);
+    int has_tvm = inject_remote(pid, g_ring, RING_PAGES * 0x1000, 0, &ring_tva) == 0;
+    g_ring_tva = ring_tva;
 
     size_t emitted = 0, armed = 0;
     for (int i = 0; i < g_hook_count; i++) {
@@ -314,15 +483,23 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
         h->code = code + (size_t)i * PT_TRAMPOLINE_MAX;
         if (trampoline_emit(has_tvm ? ring_tva : (uint64_t)(uintptr_t)g_ring,
                             h->original, (uint32_t)i,
-                            h->code, PT_TRAMPOLINE_MAX, &len) == 0) {
+                            h->code, PT_TRAMPOLINE_MAX, &len) == 0)
             emitted++;
-            if (has_tvm) {
-                h->code_target = code_tva + (uint64_t)i * PT_TRAMPOLINE_MAX;
-                if (pt_write(pid, h->slot_addr, &h->code_target, 8) == 0) {
-                    h->patched = 1;
-                    armed++;
-                }
-            }
+        else
+            h->code = 0;
+    }
+    has_tvm = has_tvm && inject_remote(pid, code, code_pages, 1, &code_tva) == 0;
+    munmap(code, code_pages);
+
+    for (int i = 0; has_tvm && i < g_hook_count; i++) {
+        struct hook_rec *h = &g_hooks[i];
+        if (!h->code)
+            continue;
+        h->code_target = code_tva + (uint64_t)i * PT_TRAMPOLINE_MAX;
+        if (pt_write(pid, h->slot_addr, &h->code_target, 8) == 0) {
+            h->patched = 1;
+            armed++;
+            printf("  hooked %s.%s\n", h->mod, h->fn);
         }
     }
 
@@ -334,11 +511,11 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
 
     printf("prosperotrace: %d/%d slots emitted, %lu armed, %zu filtered%s\n",
            (int)emitted, g_hook_count, armed, skipped_total,
-           has_tvm ? "" : " (remote page injection glue pending — see docs/DESIGN.md)");
+           has_tvm ? "" : " (could not map pages in the target)");
     return 0;
 }
 
-int pt_hooks_remove(pid_t pid)
+int pt_hooks_remove(pid_t pid, int restore)
 {
     if (g_reader_run) {
         g_reader_run = 0;
@@ -346,7 +523,7 @@ int pt_hooks_remove(pid_t pid)
     }
     int rc = 0;
     for (int i = 0; i < g_hook_count; i++) {
-        if (g_hooks[i].patched) {
+        if (g_hooks[i].patched && restore) {
             uint64_t cur;
             if (pt_read(pid, g_hooks[i].slot_addr, &cur, sizeof(cur)) == 0 &&
                 cur != g_hooks[i].original &&
