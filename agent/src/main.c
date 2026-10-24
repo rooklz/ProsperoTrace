@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "hook.h"
 #include "stream.h"
 #include "target.h"
 
@@ -50,11 +51,13 @@ int main(void)
     }
     pt_log_hello(st, pid, name ? name : "?", "13.40");
 
-    /* M2: enumerate modules in the target and install PLT hooks here. */
+    if (pt_hooks_install(pid, st) != 0)
+        printf("prosperotrace: hook install incomplete, streaming lifecycle events only\n");
 
     while (pt_target_alive(pid))
         sleep(1);
 
+    pt_hooks_remove(pid);
     pt_detach(pid);
     pt_stream_close(st);
     printf("prosperotrace: done\n");

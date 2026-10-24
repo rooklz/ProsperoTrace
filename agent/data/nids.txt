@@ -1,0 +1,9 @@
+# NID symbol table — one symbol per line: <module> <function> <nid-64bit-hex>
+# Lines starting with # are comments.
+#
+# Sources for filling this in (all public symbol-hash material):
+#   - AnyPS5 core/libs/prx declarations (github.com/boykopovar/AnyPS5)
+#   - ps4libdoc-derived lists circulating in the homebrew SDKs
+#
+# The agent logs unresolved NIDs as "nid_0x…", so gaps are self-reporting.
+# Keep sorted by module then function for readability (nidgen sorts by nid).
