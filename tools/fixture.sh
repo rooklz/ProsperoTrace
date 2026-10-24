@@ -5,9 +5,11 @@
 #   PS5_IP=192.168.10.192 HOST_IP=192.168.10.190 \
 #   ANALYTICS=../prospero-analytics tools/fixture.sh [--update]
 #
-# Needs: ps5-payload-sdk (PS5_PAYLOAD_SDK), the console's elfldr on 9021 and
-# its FTP server on 2121 (for /data/prosperotrace.conf), and a checkout of
-# rooklz/prospero-analytics for the receiver and tracediff.
+# Needs: ps5-payload-sdk (PS5_PAYLOAD_SDK, or it is searched in common
+# locations), the console's elfldr on 9021 and its FTP server on 2121 (for
+# /data/prosperotrace.conf), and a checkout of rooklz/prospero-analytics
+# for the receiver and tracediff. An LLVM toolchain (Homebrew llvm is
+# found automatically) is needed to build the agent and ptdemo.
 #
 # Each capture is checked against prospero-analytics' EVENT_FORMAT.md
 # (host/validate.py). With FIXTURE_OUT set, the capture, a tracedb database
@@ -23,7 +25,36 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PS5_IP="${PS5_IP:?set PS5_IP to the console address}"
 HOST_IP="${HOST_IP:?set HOST_IP to the address the console uses to reach this host}"
 ANALYTICS="${ANALYTICS:?set ANALYTICS to a prospero-analytics checkout}"
-SDK="${PS5_PAYLOAD_SDK:?set PS5_PAYLOAD_SDK}"
+SDK="${PS5_PAYLOAD_SDK:-}"
+
+# Locate the payload SDK if the caller did not export PS5_PAYLOAD_SDK.
+if [ -z "$SDK" ]; then
+    for d in "$HOME/ps5/dev/ps5-payload-sdk" /opt/ps5-payload-sdk; do
+        [ -f "$d/toolchain/prospero.cmake" ] && SDK="$d" && break
+    done
+fi
+if [ -z "$SDK" ] || [ ! -f "$SDK/toolchain/prospero.cmake" ]; then
+    echo "fixture: set PS5_PAYLOAD_SDK to a ps5-payload-sdk checkout" >&2
+    exit 2
+fi
+
+# The SDK's tool wrappers need an LLVM toolchain discoverable via
+# llvm-config. Prefer the caller's choice, else look for Homebrew's.
+if ! "$SDK/bin/prospero-llvm-config" --bindir >/dev/null 2>&1; then
+    for cfg in /opt/homebrew/opt/llvm/bin/llvm-config /usr/local/opt/llvm/bin/llvm-config; do
+        if [ -x "$cfg" ]; then
+            export LLVM_CONFIG="$cfg"
+            break
+        fi
+    done
+fi
+if [ -n "${LLVM_CONFIG:-}" ]; then
+    BD=$("$SDK/bin/prospero-llvm-config" --bindir)
+    case ":$PATH:" in
+        *":$BD:"*) ;;
+        *) export PATH="$BD:$PATH" ;;
+    esac
+fi
 FTP="ftp://$PS5_IP:${PS5_FTP_PORT:-2121}"
 BASELINE="$ROOT/tests/fixtures/ptdemo-baseline.jsonl"
 UPDATE=0
