@@ -1,5 +1,9 @@
 # ProsperoTrace
 
+[![tests](https://github.com/rooklz/ProsperoTrace/actions/workflows/tests.yml/badge.svg)](https://github.com/rooklz/ProsperoTrace/actions/workflows/tests.yml)
+[![console fixture](https://github.com/rooklz/ProsperoTrace/actions/workflows/fixture.yml/badge.svg)](https://github.com/rooklz/ProsperoTrace/actions/workflows/fixture.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `strace`/`ltrace`-style call tracing for PS5 userland processes.
 
 ProsperoTrace records which OS-library functions a running process calls —
