@@ -1,0 +1,14 @@
+# build
+build/
+*.elf
+*.o
+
+# host output
+traces/
+__pycache__/
+
+# generated tables
+agent/data/nids_table.c
+
+# os
+.DS_Store
