@@ -1,4 +1,5 @@
 #include "stream.h"
+#include "jsonesc.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -131,14 +132,20 @@ void pt_log_call(struct pt_stream *s,
         return;
     }
     uint64_t seq = atomic_fetch_add_explicit(&s->seq, 1, memory_order_relaxed);
+    char emod[48], efn[96];
+    pt_json_escape(emod, sizeof(emod), mod);
+    pt_json_escape(efn, sizeof(efn), fn);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t usec = (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
     char *slot = s->ring[head % SLOT_COUNT];
     snprintf(slot, SLOT_CAP,
              "{\"type\":\"call\",\"seq\":%llu,\"ts\":%llu,\"tid\":%d,"
              "\"mod\":\"%s\",\"fn\":\"%s\",\"nid\":\"0x%llx\","
              "\"args\":[\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\"],"
              "\"ret\":\"0x%llx\"}\n",
-             (unsigned long long)seq, (unsigned long long)0 /* stub fills mono usec */,
-             tid, mod, fn, (unsigned long long)nid,
+             (unsigned long long)seq, (unsigned long long)usec,
+             tid, emod, efn, (unsigned long long)nid,
              (unsigned long long)args[0], (unsigned long long)args[1],
              (unsigned long long)args[2], (unsigned long long)args[3],
              (unsigned long long)args[4], (unsigned long long)args[5],
@@ -149,10 +156,12 @@ void pt_log_call(struct pt_stream *s,
 void pt_log_hello(struct pt_stream *s, int pid, const char *title, const char *fw)
 {
     uint64_t seq = atomic_fetch_add(&s->seq, 1);
-    char line[256];
+    char etitle[128], efw[32], line[256];
+    pt_json_escape(etitle, sizeof(etitle), title);
+    pt_json_escape(efw, sizeof(efw), fw);
     int n = snprintf(line, sizeof(line),
                      "{\"type\":\"hello\",\"pid\":%d,\"title\":\"%s\",\"fw\":\"%s\",\"seq\":%llu}\n",
-                     pid, title, fw, (unsigned long long)seq);
+                     pid, etitle, efw, (unsigned long long)seq);
     if (n > 0)
         send_all(s->fd, line, (size_t)n);
 }
