@@ -141,8 +141,13 @@ int main(void)
     pt_log_hello(st, pid, name ? name : (pid_file ? pid_file : "?"), fw);
 
     pt_hooks_set_base(base, dyn);
-    if (pt_hooks_install(pid, st) != 0)
-        printf("prosperotrace: hook install failed\n");
+    if (pt_hooks_install(pid, st) != 0) {
+        printf("prosperotrace: hook install failed, detaching\n");
+        pt_hooks_remove(pid, 1);
+        pt_detach(pid);
+        pt_stream_close(st);
+        return 1;
+    }
 
     signal(SIGTERM, on_term);
     signal(SIGINT, on_term);

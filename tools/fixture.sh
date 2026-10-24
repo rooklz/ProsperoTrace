@@ -21,7 +21,7 @@
 # replaces the baseline.
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 PS5_IP="${PS5_IP:?set PS5_IP to the console address}"
 HOST_IP="${HOST_IP:?set HOST_IP to the address the console uses to reach this host}"
 ANALYTICS="${ANALYTICS:?set ANALYTICS to a prospero-analytics checkout}"
@@ -61,7 +61,7 @@ UPDATE=0
 [ "${1:-}" = "--update" ] && UPDATE=1
 
 WORK=$(mktemp -d)
-RX= ECHO=
+RX='' ECHO=''
 cleanup() {
     for p in $RX $ECHO; do
         kill "$p" 2>/dev/null || true

@@ -8,6 +8,7 @@
 #include "trampoline.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,7 +84,7 @@ static struct pt_ring *g_ring;          /* agent-side snapshot of the shared rin
 static uint64_t g_ring_tva;             /* the ring inside the target */
 static pid_t g_pid;
 static pthread_t g_reader;
-static int g_reader_run;
+static _Atomic int g_reader_run;
 static uint64_t g_main_base, g_main_dyn;
 
 void pt_hooks_set_base(uint64_t base, uint64_t dynamic)
@@ -445,7 +446,7 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
         return 0;
     }
 
-    /* shared ring (agent side; mirrored into the target once glue lands) */
+    /* the agent's snapshot of the ring; the live copy is mapped in the target */
     g_ring = mmap(0, RING_PAGES * 0x1000, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_ring == MAP_FAILED) {
@@ -455,10 +456,10 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
     }
     memset(g_ring, 0, RING_PAGES * 0x1000);
 
-    /* trampoline page */
-    size_t code_pages = (size_t)MAX_HOOKS * PT_TRAMPOLINE_MAX;
-    code_pages = (code_pages / 0x1000 + 1) * 0x1000;
-    uint8_t *code = mmap(0, code_pages, PROT_READ | PROT_WRITE | PROT_EXEC,
+    /* trampolines are assembled here, then copied into the target */
+    size_t code_pages = (size_t)g_hook_count * PT_TRAMPOLINE_MAX;
+    code_pages = (code_pages + 0xfff) & ~(size_t)0xfff;
+    uint8_t *code = mmap(0, code_pages, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANON, -1, 0);
     if (code == MAP_FAILED) {
         printf("prosperotrace: code mmap failed\n");
@@ -505,12 +506,15 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
 
     if (armed) {
         g_reader_run = 1;
-        if (pthread_create(&g_reader, 0, reader_thread, &g_emit_ctx) != 0)
+        if (pthread_create(&g_reader, 0, reader_thread, &g_emit_ctx) != 0) {
             g_reader_run = 0;
+            printf("prosperotrace: reader thread failed to start\n");
+            return -1;      /* caller restores the slots and detaches */
+        }
     }
 
-    printf("prosperotrace: %d/%d slots emitted, %lu armed, %zu filtered%s\n",
-           (int)emitted, g_hook_count, armed, skipped_total,
+    printf("prosperotrace: %zu/%d slots emitted, %zu armed, %zu filtered%s\n",
+           emitted, g_hook_count, armed, skipped_total,
            has_tvm ? "" : " (could not map pages in the target)");
     return 0;
 }
@@ -525,9 +529,11 @@ int pt_hooks_remove(pid_t pid, int restore)
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hooks[i].patched && restore) {
             uint64_t cur;
-            if (pt_read(pid, g_hooks[i].slot_addr, &cur, sizeof(cur)) == 0 &&
-                cur != g_hooks[i].original &&
-                pt_write(pid, g_hooks[i].slot_addr, &g_hooks[i].original, 8) != 0)
+            /* only undo our own patch: the target may have rebound the slot */
+            if (pt_read(pid, g_hooks[i].slot_addr, &cur, sizeof(cur)) != 0)
+                rc = -1;
+            else if (cur == g_hooks[i].code_target &&
+                     pt_write(pid, g_hooks[i].slot_addr, &g_hooks[i].original, 8) != 0)
                 rc = -1;
             g_hooks[i].patched = 0;
         }

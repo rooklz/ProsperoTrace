@@ -20,7 +20,7 @@
 struct pt_stream {
     int fd;
     pthread_t consumer;
-    int stop;
+    _Atomic int stop;
     char ring[SLOT_COUNT][SLOT_CAP];
     _Atomic uint32_t head;    /* producer writes */
     _Atomic uint32_t tail;    /* consumer reads */
