@@ -36,18 +36,25 @@ Early development. What works today:
 
 ```
 agent/    on-console tracer (C, ps5-payload-sdk) — streams events out over TCP
-host/     receiver + summarizer + tracediff (Python 3, stdlib only)
 tools/    build-time generators (NID table)
 docs/     design notes
+tests/    host-run checks (emitter, decoder, filter)
 deploy.sh pushes agent.elf to $PS5_IP:9021 (elfldr)
 ```
+
+The host-side capture and analysis tools (receiver, summarizer,
+API-surface diff) live in the separate
+**[rooklz/prospero-analytics](https://github.com/rooklz/prospero-analytics)**
+repo, which consumes only the JSONL event stream
+(`docs/EVENT_FORMAT.md` there).
 
 ## Quickstart (host side)
 
 ```sh
+git clone https://github.com/rooklz/prospero-analytics
+cd prospero-analytics
 python3 host/receiver.py --port 9029 --out traces/
 python3 host/summarize.py traces/trace-1234-*.jsonl
-# compare two runs: what API surface differs between them
 python3 host/tracediff.py traces/before.jsonl traces/after.jsonl
 ```
 

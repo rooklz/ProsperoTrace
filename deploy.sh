@@ -13,5 +13,5 @@ PORT="${PT_ELF_PORT:-9021}"
 
 echo ">> sending $(basename "$ELF") ($(wc -c < "$ELF" | tr -d ' ') bytes) to $PS5_IP:$PORT"
 nc -N "$PS5_IP" "$PORT" < "$ELF"
-echo ">> sent. Start the receiver first: python3 host/receiver.py --port 9029"
+echo ">> sent. Start the receiver first (see github.com/rooklz/prospero-analytics): python3 host/receiver.py --port 9029"
 echo ">> agent args are passed via env on the console side (see agent/src/main.c)"
