@@ -4,8 +4,9 @@
 [![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Host-side tooling and analysis for **ProsperoTrace** captures — the
-on-console tracer lives in [rooklz/ProsperoTrace](https://github.com/rooklz/ProsperoTrace).
+Host-side tooling and analysis for **ProsperoTrace** captures. This is the
+`analytics/` directory of the [rooklz/ProsperoTrace](https://github.com/rooklz/ProsperoTrace)
+repository; the on-console tracer lives in the parent directory (agent/).
 
 This repository is deliberately console-free: it only **consumes** the
 JSONL event stream that the agent produces (`docs/EVENT_FORMAT.md`) and
@@ -49,7 +50,7 @@ python3 host/tracedb.py functions traces.db --top 30
 python3 host/tracedb.py who traces.db 'sceKernel*'           # fn or mod.fn, glob patterns
 python3 host/tracedb.py common traces.db                     # functions every capture calls
 python3 host/tracedb.py fwdiff traces.db 13.40 14.10         # called on one firmware, never the other
-python3 host/tracedb.py coverage traces.db ../ProsperoTrace/agent/data/nids.txt [--missing]
+python3 host/tracedb.py coverage traces.db ../agent/data/nids.txt [--missing]
 python3 host/tracedb.py args traces.db sceKernelOpen         # per-slot distinct values, ranges, top values
 python3 host/tracedb.py sql traces.db "SELECT fw, count(*) FROM captures GROUP BY fw"
 
@@ -96,7 +97,7 @@ The roadmap is done: SQLite import and query layer (`tracedb`), dashboard
 arg-pattern analysis (`tracedb args`, `priority.py` sketches), the corpus
 (`catalogue.py`), console/desktop parity (`parity.py`), the coverage matrix
 (`coveragemap.py`), CI, and the console fixture. The fixture lives with the
-agent, in ProsperoTrace's `tools/fixture.sh`: it traces a demo payload on a
+agent, in the parent repo's `tools/fixture.sh`: it traces a demo payload on a
 real console with this repo's receiver and fails if `tracediff` finds a
 function that surfaced or disappeared against the stored baseline.
 

@@ -7,7 +7,8 @@ Thanks for helping with the analytics tooling. Scope and conventions:
 This repo is **host-side only**. It consumes trace captures (JSONL per
 `docs/EVENT_FORMAT.md`) and produces reports, queries and comparisons. The
 on-console tracer and anything that touches the console runtime lives in
-the sibling repo [rooklz/ProsperoTrace](https://github.com/rooklz/ProsperoTrace).
+the parent directory of this repository (the console-facing `agent/` and `tools/`,
+part of [rooklz/ProsperoTrace](https://github.com/rooklz/ProsperoTrace)).
 
 If a change needs a new field in the event stream, add it to
 `docs/EVENT_FORMAT.md` here (compatibility rules apply), not only to the
