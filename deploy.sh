@@ -1,17 +1,21 @@
 #!/bin/sh
-# deploy.sh <agent.elf> [--pid N] [--host IP] [--port N]
-# Sends the agent ELF to the console's elfldr, then prints how to launch.
+# deploy.sh <agent.elf> — send the agent to the console's elfldr.
+#
+# elfldr starts payloads without arguments or environment, so the agent
+# reads /data/prosperotrace.conf (see the README); upload it first. Start
+# the receiver before deploying: the agent connects out to it.
+#
+#   PS5_IP=192.168.10.192 ./deploy.sh build/prosperotrace.elf
 set -eu
 
-ELF="${1:?usage: deploy.sh <agent.elf> [--pid N] [--host IP] [--port N]}"
-shift || true
-
-PS5_IP="${PS5_IP:?set PS5_IP to the console's address}"
+ELF="${1:?usage: deploy.sh <agent.elf>}"
+PS5_IP="${PS5_IP:?set PS5_IP to the console address}"
 PORT="${PT_ELF_PORT:-9021}"
 
 [ -f "$ELF" ] || { echo "no such file: $ELF" >&2; exit 1; }
 
-echo ">> sending $(basename "$ELF") ($(wc -c < "$ELF" | tr -d ' ') bytes) to $PS5_IP:$PORT"
-nc -N "$PS5_IP" "$PORT" < "$ELF"
-echo ">> sent. Start the receiver first (see github.com/rooklz/prospero-analytics): python3 host/receiver.py --port 9029"
-echo ">> agent args are passed via env on the console side (see agent/src/main.c)"
+SIZE=$(wc -c < "$ELF" | tr -d ' ')
+NAME=$(basename "$ELF")
+echo ">> sending $NAME ($SIZE bytes) to $PS5_IP:$PORT"
+nc -w 5 "$PS5_IP" "$PORT" < "$ELF"
+echo ">> sent; progress is in ftp://$PS5_IP:2121/data/prosperotrace.log"
