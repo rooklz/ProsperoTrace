@@ -59,13 +59,18 @@ socketserver.ThreadingTCPServer(("0.0.0.0", 9030), Echo).serve_forever()' > /dev
 ECHO=$!
 sleep 1
 
+curl -s --max-time 5 -Q "DELE /data/prosperotrace.log" "$FTP/" -o /dev/null 2>&1 || true  # a stale log would look done
 echo ">> sending ptdemo, then the agent, to $PS5_IP:9021"
 nc -w 5 "$PS5_IP" 9021 < "$WORK/ptdemo.elf" || die "elfldr not reachable"
 sleep 2
 nc -w 5 "$PS5_IP" 9021 < "$WORK/build/prosperotrace.elf" || die "elfldr not reachable"
 
-# ptdemo waits 8 s, runs 5 s, lingers 1 s; give the agent time to detach
-sleep 22
+# ptdemo waits 8 s, runs 5 s, lingers 1 s; the agent logs "done" once it
+# has drained the ring and detached
+for _ in $(seq 1 60); do
+    sleep 1
+    curl -sf --max-time 5 "$FTP/data/prosperotrace.log" 2>/dev/null | grep -q "prosperotrace: done" && break
+done
 kill -INT "$RX"; wait "$RX" 2>/dev/null || true; RX=
 curl -sf --max-time 5 "$FTP/data/prosperotrace.log" > "$WORK/agent.log" || true
 sed 's/^/   agent: /' "$WORK/agent.log" | grep -v "hooked" || true
