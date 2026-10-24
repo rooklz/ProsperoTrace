@@ -21,6 +21,7 @@ add_custom_command(
 
 add_executable(prosperotrace
     src/main.c
+    src/conf.c
     src/stream.c
     src/jsonesc.c
     src/target.c

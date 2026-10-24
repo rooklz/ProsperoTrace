@@ -1,0 +1,31 @@
+# Console fixture: trace demo/ptdemo.c on a real PS5 and diff the API
+# surface against tests/fixtures/ptdemo-baseline.jsonl. Needs a self-hosted
+# runner labelled "ps5" on the console's network, with ps5-payload-sdk
+# installed and these repository variables set: PS5_IP, HOST_IP,
+# PS5_PAYLOAD_SDK. Run it by hand from the Actions tab.
+name: console fixture
+on:
+  workflow_dispatch:
+jobs:
+  fixture:
+    runs-on: [self-hosted, ps5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: rooklz/prospero-analytics
+          path: prospero-analytics
+      - name: trace ptdemo and diff against the baseline
+        env:
+          PS5_IP: ${{ vars.PS5_IP }}
+          HOST_IP: ${{ vars.HOST_IP }}
+          PS5_PAYLOAD_SDK: ${{ vars.PS5_PAYLOAD_SDK }}
+          ANALYTICS: prospero-analytics
+          FIXTURE_OUT: ${{ runner.temp }}
+        run: tools/fixture.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: capture
+          path: ${{ runner.temp }}/trace-*.jsonl
+          if-no-files-found: ignore

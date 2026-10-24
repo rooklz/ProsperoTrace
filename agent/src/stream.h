@@ -22,4 +22,7 @@ void pt_log_call(struct pt_stream *s,
                  uint64_t nid, const uint64_t args[6], uint64_t ret);
 
 /* consumer-side; internal */
+/* count events lost before they reached the stream (e.g. target ring laps) */
+void pt_log_drops(struct pt_stream *s, uint32_t n);
+
 void pt_log_hello(struct pt_stream *s, int pid, const char *title, const char *fw);

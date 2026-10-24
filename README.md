@@ -15,22 +15,35 @@ binaries; it builds exclusively on the public homebrew SDKs
 
 ## Status
 
-Early development. What works today:
+Working end to end on a console (fw 13.40): the agent attaches to a running
+payload, hooks its imports, streams every call, and detaches cleanly. The
+console fixture (`tools/fixture.sh`) traces `demo/ptdemo.c` (TCP echo client,
+file I/O, heap churn, a worker thread) and diffs it against the stored
+baseline: ~650 calls over 21 functions in libkernel and libSceLibcInternal,
+0 dropped.
 
-- [x] host receiver (`host/receiver.py`) — full JSONL capture, live filters, summary
-- [x] trace summarizer (`host/summarize.py`)
-- [x] NID table generator (`tools/nidgen.py`) — text list → C header
+- [x] host receiver, summarizer, diff, SQLite query layer, dashboard
+      ([prospero-analytics](https://github.com/rooklz/prospero-analytics))
+- [x] NID table generator (`tools/nidgen.py`) — text list → C table
 - [x] agent: connect-out streaming with SPSC ring buffer + drop accounting
-- [x] agent: process discovery (`kern.proc` sysctl)
-- [x] agent: trampoline emitter (x86-64, byte-verified against a reference — `tests/check_trampoline.sh`)
-- [x] agent: shared ring transport + decoder with entry/ret pairing (host-tested — `tests/ring_decode_test.c`)
-- [x] agent: hook selection filter (`PT_FILTER`, globs on `mod.fn`; host-tested — `tests/filter_test.c`)
-- [x] agent: PLT/GOT scan + candidate collection
-- [ ] agent: remote page injection glue (`PT_SYSCTRL` map) + GOT write-up — the last step before on-console arming
-- [ ] agent: dynlib module walk (instrument loaded PRXs beyond the main executable)
-- [ ] agent: inline-detour fallback for intra-module calls
-- [ ] NID table coverage beyond the seed set
-- [ ] `deploy.sh` end-to-end run against a real title
+- [x] agent: ptrace attach with debugger credentials, signal forwarding,
+      stop-restore-detach on exit
+- [x] agent: remote `mmap` in the target (one single-stepped syscall), code
+      pages flipped to RX with `kernel_mprotect`
+- [x] agent: GOT hooking of `JUMP_SLOT` and `GLOB_DAT` imports (NID-named
+      and plain-named), module attribution from `DT_NEEDED`
+- [x] agent: trampoline with atomic slot reservation, full register and
+      stack-argument forwarding (executed in `tests/trampoline_exec_test.c`)
+- [x] agent: remote ring reader that keeps blocking calls and counts laps
+- [x] config file (`/data/prosperotrace.conf`) and log
+      (`/data/prosperotrace.log`), since elfldr passes no environment
+- [x] console fixture (`tools/fixture.sh`, `.github/workflows/fixture.yml`)
+
+Known limits: the tracer hooks the main executable's imports (calls between
+system libraries are not seen); `tid` is 0; calls in the last ~2 ms before
+the target exits can be lost, since the ring lives in the target's memory;
+functions that return twice or never return (`setjmp`, `longjmp`, `exit`,
+...) are never hooked.
 
 ## Layout
 
@@ -38,7 +51,10 @@ Early development. What works today:
 agent/    on-console tracer (C, ps5-payload-sdk) — streams events out over TCP
 tools/    build-time generators (NID table)
 docs/     design notes
-tests/    host-run checks (emitter, decoder, filter)
+demo/     ptdemo, the fixture workload
+tests/    host-run checks (emitter bytes and execution, decoder, filter,
+          escaping, config) and the console fixture baseline
+tools/fixture.sh  trace ptdemo on a console and diff against the baseline
 deploy.sh pushes agent.elf to $PS5_IP:9021 (elfldr)
 ```
 
@@ -62,13 +78,33 @@ python3 host/tracediff.py traces/before.jsonl traces/after.jsonl
 
 ```sh
 cd agent
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=$PS5_PAYLOAD_SDK/cmake/toolchain-ps5.cmake
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=$PS5_PAYLOAD_SDK/toolchain/prospero.cmake
 cmake --build build
-PS5_IP=192.168.10.192 ./deploy.sh build/prosperotrace.elf --pid 1234
+
+# elfldr gives payloads no environment: configure through /data
+printf 'PT_HOST=192.168.10.190\nPT_PID=1234\n' > prosperotrace.conf
+curl -T prosperotrace.conf ftp://192.168.10.192:2121/data/prosperotrace.conf
+PS5_IP=192.168.10.192 ../deploy.sh build/prosperotrace.elf
+curl ftp://192.168.10.192:2121/data/prosperotrace.log     # agent progress
 ```
 
-The agent connects out to the host (`--host` / `PT_HOST` env), so the
-receiver must be listening first.
+Keys (see `agent/src/main.c`): `PT_HOST`, `PT_PORT`, `PT_PID` / `PT_NAME` /
+`PT_PID_FILE`, `PT_BASE` + `PT_DYNAMIC` (elfldr payloads, whose ELF headers
+are not mapped), `PT_FILTER` (comma-separated `mod.fn` globs). The agent
+connects out to the host, so the receiver must be listening first.
+
+## Console fixture
+
+```sh
+PS5_IP=192.168.10.192 HOST_IP=192.168.10.190 ANALYTICS=../prospero-analytics \
+PS5_PAYLOAD_SDK=~/ps5-payload-sdk tools/fixture.sh            # diff vs baseline
+tools/fixture.sh --update                                      # re-record it
+```
+
+Exits 1 if a function surfaced or disappeared compared to
+`tests/fixtures/ptdemo-baseline.jsonl`; rate changes are printed per 1000
+calls. `.github/workflows/fixture.yml` runs the same on a self-hosted runner
+labelled `ps5`.
 
 ## Event format
 
@@ -76,7 +112,7 @@ One JSON object per line:
 
 ```json
 {"type":"hello","pid":1234,"title":"ftpsrv","fw":"13.40","seq":0}
-{"type":"call","seq":1,"ts":18273645,"tid":100051,"mod":"libkernel","fn":"sceKernelOpen","args":["0x2000a340","0x0","0x0"],"ret":"0x5"}
+{"type":"call","seq":3,"ts":20049976182,"tid":0,"mod":"libkernel","fn":"socket","nid":"0x0","args":["0x2","0x1","0x0","0x0","0x0","0x0"],"ret":"0x7"}
 {"type":"drops","seq":2,"n":137}
 ```
 

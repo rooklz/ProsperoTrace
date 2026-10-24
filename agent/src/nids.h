@@ -13,3 +13,4 @@ extern const struct nid_entry g_nid_table[];
 extern const unsigned long g_nid_table_count;
 
 const struct nid_entry *nid_lookup(uint64_t nid);
+const struct nid_entry *nid_lookup_name(const char *fn);

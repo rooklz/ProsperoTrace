@@ -6,17 +6,17 @@
 #
 # Contract (see agent/src/ring.h):
 #   - each hook = one trampoline = this sequence
-#   - entry block writes an 8-lane event, rounds `head` by +2 (ret lane reserved)
-#   - calls the original, then writes the ret lane
-#   - never clobbers callee-saved registers; frame 0x50 bytes; RWX-not-needed
+#   - head is reserved atomically (+2: entry and ret lane-groups); head stays
+#     even, so a pair never straddles the end of the ring
+#   - the ret tag is cleared on entry and written last, so the reader can tell
+#     an in-flight call from a finished one
+#   - the original sees its exact register state (rax included, for varargs)
+#     and the first eight stack-passed arguments; rax:rdx are returned as is
 #
 # Fixed patch points (imm64 operands):
 #   RING_VA  - address of the shared ring (target VA)
-#   ORIG_VA  - original function entry; used for the call and the tail jump
+#   ORIG_VA  - original function entry
 #   TAG_ENTRY / TAG_RET - lane0 tag words ((PT_TAG_ENTRY<<32)|hook_index)
-#
-# Not position-independent by design: every template is placed and patched
-# once per hook with absolute addresses. See trampoline.c for the byte table.
 
 .intel_syntax noprefix
 .globl tramp_entry
@@ -28,26 +28,29 @@
 .equ TAG_RET,   0x0000000200000007   # tag=2, hook_index=7
 
 tramp_entry:
-        # ---- prologue: preserve all callee-saved, save six arg regs
         push    rbp
         mov     rbp, rsp
-        sub     rsp, 0x50
+        sub     rsp, 0x90               # 0x50 locals + 0x40 outgoing stack args
         mov     [rbp-0x08], rdi
         mov     [rbp-0x10], rsi
         mov     [rbp-0x18], rdx
         mov     [rbp-0x20], rcx
         mov     [rbp-0x28], r8
         mov     [rbp-0x30], r9
+        mov     [rbp-0x50], rax         # al = vector-arg count for varargs
 
-        # ---- entry event
+        # ---- reserve an even slot pair
         movabs  rax, RING_VA
-        mov     edx, [rax]              # head
-        and     edx, 0x3f               # % PT_RING_CAP_EVENTS
-        shl     rdx, 6                  # * PT_EVENT_LANES(8) * 8
-        lea     rdx, [rax+rdx+16]       # &slots[idx]
-        movabs  r11, TAG_ENTRY
-        mov     [rdx], r11              # lane0 = tag word
-        mov     rax, [rbp-0x08]         # lane1..6 = args
+        mov     edx, 2
+        lock xadd [rax], edx            # edx = old head
+        and     edx, 0x3e
+        shl     rdx, 6
+        lea     rdx, [rax+rdx+16]       # &slot[old head]
+        mov     [rbp-0x38], rdx
+        mov     qword ptr [rdx+0x40], 0 # ret tag: in flight
+
+        # ---- entry event; tag written last
+        mov     rax, [rbp-0x08]
         mov     [rdx+0x08], rax
         mov     rax, [rbp-0x10]
         mov     [rdx+0x10], rax
@@ -59,25 +62,42 @@ tramp_entry:
         mov     [rdx+0x28], rax
         mov     rax, [rbp-0x30]
         mov     [rdx+0x30], rax
-        mov     [rbp-0x40], rax        # stash ring ptr
-        mov     [rbp-0x38], rdx        # stash entry slot ptr
-        add     dword ptr [rax], 2      # reserve entry+ret lanes
-
-        # ---- call original; rax = return value
-        movabs  rax, ORIG_VA
-        call    rax
-        mov     [rbp-0x48], rax
-
-        # ---- ret event (slot = entry_slot + 8 lanes)
-        mov     rdx, [rbp-0x38]
-        add     rdx, 0x40
-        movabs  r11, TAG_RET
+        movabs  r11, TAG_ENTRY
         mov     [rdx], r11
-        mov     rax, [rbp-0x48]
-        mov     [rdx+0x38], rax         # lane7 = ret value
 
-        # ---- epilogue: restore frame and tail-jump original
-        add     rsp, 0x50
-        pop     rbp
-        movabs  rax, ORIG_VA
-        jmp     rax
+        # ---- forward up to eight stack-passed arguments
+        mov     rax, [rbp+0x10]
+        mov     [rsp+0x00], rax
+        mov     rax, [rbp+0x18]
+        mov     [rsp+0x08], rax
+        mov     rax, [rbp+0x20]
+        mov     [rsp+0x10], rax
+        mov     rax, [rbp+0x28]
+        mov     [rsp+0x18], rax
+        mov     rax, [rbp+0x30]
+        mov     [rsp+0x20], rax
+        mov     rax, [rbp+0x38]
+        mov     [rsp+0x28], rax
+        mov     rax, [rbp+0x40]
+        mov     [rsp+0x30], rax
+        mov     rax, [rbp+0x48]
+        mov     [rsp+0x38], rax
+
+        # ---- call the original with the caller's registers
+        mov     rdx, [rbp-0x18]
+        mov     rax, [rbp-0x50]
+        movabs  r11, ORIG_VA
+        call    r11
+        mov     [rbp-0x48], rax
+        mov     [rbp-0x40], rdx
+
+        # ---- ret event: lane7 = rax, then publish the tag
+        mov     r11, [rbp-0x38]
+        mov     [r11+0x78], rax
+        movabs  rax, TAG_RET
+        mov     [r11+0x40], rax
+
+        mov     rax, [rbp-0x48]
+        mov     rdx, [rbp-0x40]
+        leave
+        ret

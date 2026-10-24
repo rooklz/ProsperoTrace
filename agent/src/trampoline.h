@@ -19,7 +19,7 @@
  * is PT_TRAMPOLINE_MAX.
  */
 
-#define PT_TRAMPOLINE_MAX 256u
+#define PT_TRAMPOLINE_MAX 320u
 
 int trampoline_emit(uint64_t ring_va, uint64_t orig_va, uint32_t hook_index,
                     uint8_t *out, size_t cap, size_t *out_len);

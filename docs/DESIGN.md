@@ -65,20 +65,30 @@ target ──GOT──▶ trampoline ──stores──▶ shared ring (in-targe
 
 Two buffers by design:
 
-- **Shared ring** (target→agent). The trampolines write fixed-size events
-  (8×u64 lanes per event; entry and ret lane-groups) with plain stores, and
-  the reader drains from the same page. No locks — the target bumps `head`
-  per event pair and the reader never races past it. Layout in
-  `agent/src/ring.h`; the entry/ret pairing decoder lives in
-  `agent/src/ring_decode.c` and is host-tested (`tests/ring_decode_test.c`).
-- **Stream ring** (agent→socket). The existing SPSC ring in `stream.c`
-  batches events into TCP sends; this is where drops are counted and
-  reported as `{"type":"drops"}` records.
+- **Shared ring** (target→agent). A page the agent maps inside the target
+  (`pt_remote_mmap`: one `mmap` syscall single-stepped in the stopped
+  target). Each call reserves an even slot pair with `lock xadd head, 2`,
+  clears the ret tag, writes the entry lane-group (tag last), calls the
+  original, then writes the ret lane-group (tag last). The reader copies the
+  page out every 2 ms; an entry whose ret tag is still 0 is a call in flight
+  and holds the tail (up to 0.5 s, then it is given up), so blocking calls
+  are kept. If the target laps the reader, the overwritten pairs are counted
+  as drops. Layout in `agent/src/ring.h`, decoder in
+  `agent/src/ring_decode.c` (`tests/ring_decode_test.c`).
+- **Stream ring** (agent→socket). The SPSC ring in `stream.c` batches
+  events into TCP sends; this is where drops are counted and reported as
+  `{"type":"drops"}` records.
 
-Backpressure policy: never block the target on I/O. If the shared ring is
-full the trampoline skips the write — insertion is a single non-atomic
-`head` bump, so under heavy concurrency the tracer may lose a race rather
-than stall; per-thread slot reservation (seqlock-style) is M4.
+Backpressure policy: never block the target. The trampoline never waits on
+the reader; a full ring overwrites the oldest pairs and the reader reports
+them as dropped.
+
+Trampoline contract: the original sees the caller's exact registers (`rax`
+included, which carries the vector-register count for varargs) and the
+first eight stack-passed arguments; `rax:rdx` come back unchanged. Code
+pages are mapped RW, written, then flipped to RX (`kernel_mprotect`) since
+the platform refuses RWX; they are never unmapped, because a thread may
+still be inside a trampoline when the agent detaches.
 
 The trampolines are emitted by `agent/src/trampoline.c` from the canonical
 byte sequence in `tests/trampoline_ref.s`; `tests/check_trampoline.sh`
