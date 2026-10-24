@@ -22,8 +22,12 @@ Early development. What works today:
 - [x] NID table generator (`tools/nidgen.py`) — text list → C header
 - [x] agent: connect-out streaming with SPSC ring buffer + drop accounting
 - [x] agent: process discovery (`kern.proc` sysctl)
-- [ ] agent: PLT/GOT hooking in the target process (in progress — see `docs/DESIGN.md`)
-- [ ] agent: inline-detour fallback for non-PLT calls
+- [x] agent: trampoline emitter (x86-64, byte-verified against a reference — `tests/check_trampoline.sh`)
+- [x] agent: shared ring transport + reader thread (entry/ret pairing)
+- [x] agent: PLT/GOT scan + candidate collection
+- [ ] agent: remote page injection glue (`PT_SYSCTRL` map) + GOT write-up — the last step before on-console arming
+- [ ] agent: dynlib module walk (instrument loaded PRXs beyond the main executable)
+- [ ] agent: inline-detour fallback for intra-module calls
 - [ ] NID table coverage beyond the seed set
 - [ ] `deploy.sh` end-to-end run against a real title
 

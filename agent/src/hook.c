@@ -1,11 +1,17 @@
 #include "hook.h"
 #include "nids.h"
+#include "ring.h"
 #include "target.h"
+#include "trampoline.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 /* ELF64 definitions needed locally (toolchain headers vary on these) */
 typedef struct {
@@ -43,29 +49,46 @@ typedef struct { uint64_t st_name; uint8_t st_info, st_other; uint16_t st_shndx;
 #define ELFMAG   "\177ELF"
 #define SELFMAG  4
 
-/*
- * Module enumeration: the platform's dynamic linker keeps per-process
- * module metadata behind libkernel's dynlib helpers. We resolve the two
- * entry points we need (list handles, map a handle to its ELF base) the
- * same way other payloads do — by lookup against the already-resolved
- * libkernel imports of our own process. Handles are small integers, and
- * handle 0 is the main executable.
- */
-
 #define MAX_MODULES   64
 #define MAX_HOOKS     512
-#define TRAMP_PAGE    0x4000
+
+#define RING_PAGES  (PT_RING_SIZE / 0x1000 + 2)
+
+/* ------------------------------------------------------------------ */
 
 struct hook_rec {
-    uint64_t slot_addr;   /* GOT address in the target */
-    uint64_t original;    /* original slot value */
+    uint64_t slot_addr;          /* GOT address in the target */
+    uint64_t original;           /* original slot value        */
+    uint64_t nid;
+    char mod[32];
+    char fn[64];
+    uint8_t *code;               /* agent-side emitted trampoline */
+    uint64_t code_target;        /* target VA once armed         */
+    int patched;
 };
 
 static struct hook_rec g_hooks[MAX_HOOKS];
 static int g_hook_count = -1;
 static struct pt_stream *g_stream;
 
-/* ---- target memory helpers with validation -------------------------- */
+static struct pt_ring *g_ring;          /* agent-side view of the shared ring */
+
+struct pending { int active; struct pt_event ev; };
+static struct pending g_pending[MAX_HOOKS];
+static pthread_t g_reader;
+static int g_reader_run;
+
+/* module enumeration: platform's dynamic linker keeps per-process metadata
+ * behind libkernel's dynlib helpers. Resolved the way other payloads do it —
+ * handle 0 is the main executable; the loaded PRX set follows (M2.1). */
+static uint64_t module_base(pid_t pid, int handle)
+{
+    (void)pid;
+    (void)handle;
+    return 0;   /* glue: dynlib handle -> ELF base; see docs/DESIGN.md */
+}
+
+/* ---- target memory helpers with validation ----------------------- */
 
 static int read_or_fail(pid_t pid, uint64_t addr, void *buf, size_t len, const char *what)
 {
@@ -76,15 +99,15 @@ static int read_or_fail(pid_t pid, uint64_t addr, void *buf, size_t len, const c
     return 0;
 }
 
-/* ---- ELF/dynamic parsing -------------------------------------------- */
+/* ---- ELF/dynamic parsing ------------------------------------------- */
 
 struct dyninfo {
-    uint64_t jmprel;      /* DT_JMPREL */
-    uint64_t pltrelsz;    /* DT_PLTRELSZ */
-    uint64_t pltgot;      /* DT_PLTGOT */
-    uint64_t strtab;      /* DT_STRTAB */
-    uint64_t symtab;      /* DT_SYMTAB */
-    uint64_t relaent;     /* DT_RELAENT (24 expected) */
+    uint64_t jmprel;
+    uint64_t pltrelsz;
+    uint64_t pltgot;
+    uint64_t strtab;
+    uint64_t symtab;
+    uint64_t relaent;
 };
 
 static int read_dynamic(pid_t pid, uint64_t base, struct dyninfo *di)
@@ -128,26 +151,22 @@ static int read_dynamic(pid_t pid, uint64_t base, struct dyninfo *di)
     return (di->jmprel && di->pltrelsz && di->pltgot) ? 0 : -1;
 }
 
-/*
- * The platform names imports by NID, not by string: each JUMP_SLOT's symbol
- * carries the NID in st_name's upper bits under Sony's extended info scheme.
- * nid_of_reloc() is where that extraction lives; the seed table carries
- * known (nid -> name) pairs and anything unresolved is logged by raw NID.
- */
+/* The platform names imports by NID: each JUMP_SLOT symbol carries the NID
+ * in st_name under Sony's extended info scheme. */
 static uint64_t nid_of_reloc(pid_t pid, const struct dyninfo *di, const Elf64_Rela *r)
 {
     Elf64_Sym sym;
     uint64_t sym_addr = di->symtab + ELF64_R_SYM(r->r_info) * sizeof(sym);
     if (pt_read(pid, sym_addr, &sym, sizeof(sym)) != 0)
         return 0;
-    return sym.st_name;   /* platform stores the NID here for dynlink imports */
+    return sym.st_name;
 }
 
 static int hook_module(pid_t pid, uint64_t base)
 {
     struct dyninfo di;
     if (read_dynamic(pid, base, &di) != 0)
-        return 0;   /* not a dynamic module (e.g. PRX without PLT) — skip */
+        return 0;   /* not a dynamic module (no PLT) — skip */
 
     size_t count = di.pltrelsz / di.relaent;
     for (size_t i = 0; i < count && g_hook_count < MAX_HOOKS; i++) {
@@ -161,39 +180,105 @@ static int hook_module(pid_t pid, uint64_t base)
         uint64_t nid = nid_of_reloc(pid, &di, &r);
         const struct nid_entry *e = nid ? nid_lookup(nid) : 0;
 
-        uint64_t slot = di.pltgot + 24 + i * 8;  /* skip resolver+linkmap entries */
+        uint64_t slot = di.pltgot + 24 + i * 8;  /* skip resolver+linkmap */
         uint64_t orig;
         if (pt_read(pid, slot, &orig, sizeof(orig)) != 0)
             return -1;
 
-        /* M2: trampolines are emitted into a page allocated in the target
-         * (PT_SYSCTRL mmap). Each trampoline captures the six argument
-         * registers, calls pt_log_call via the agent's shared stub, then
-         * tail-jumps to `orig`. Until the emitter lands we only record the
-         * slot — no writes happen yet. */
-        g_hooks[g_hook_count].slot_addr = slot;
-        g_hooks[g_hook_count].original = orig;
+        struct hook_rec *h = &g_hooks[g_hook_count];
+        h->slot_addr = slot;
+        h->original = orig;
+        h->nid = nid;
+        snprintf(h->mod, sizeof(h->mod), "%s", e ? e->mod : "?");
+        if (e)
+            snprintf(h->fn, sizeof(h->fn), "%s", e->fn);
+        else
+            snprintf(h->fn, sizeof(h->fn), "nid_0x%llx", (unsigned long long)nid);
+        h->code = 0;
+        h->code_target = 0;
+        h->patched = 0;
         g_hook_count++;
-        printf("  hook cand: %-18s 0x%llx -> %s.%s\n",
-               "", (unsigned long long)slot,
-               e ? e->mod : "?", e ? e->fn : "(unnamed nid)");
+        printf("  hook cand: %-24s 0x%llx\n", h->fn, (unsigned long long)slot);
     }
     return 0;
 }
+
+/* ---- ring service thread -------------------------------------------- */
+
+static void reader_drain(void)
+{
+    uint32_t head = g_ring->head;
+    uint32_t tail = g_ring->tail;
+
+    while (tail != head) {
+        uint32_t s = tail & PT_RING_MASK;
+        uint64_t tag = g_ring->slot[s].lane[0];
+        uint32_t kind = pt_tag_kind(tag);
+        uint32_t idx = pt_tag_index(tag);
+
+        if (kind == PT_TAG_ENTRY) {
+            if (idx < MAX_HOOKS) {
+                g_pending[idx].active = 1;
+                g_pending[idx].ev = g_ring->slot[s];
+            }
+        } else if (kind == PT_TAG_RET) {
+            uint32_t ent = (uint32_t)((s - 1) & PT_RING_MASK);
+            /* ret events land in the lane-group right after their entry */
+            if (idx < MAX_HOOKS && g_pending[idx].active) {
+                const struct hook_rec *h = &g_hooks[idx];
+                const struct pt_event *e = &g_pending[idx].ev;
+                uint64_t args[6];
+                for (int a = 0; a < 6; a++)
+                    args[a] = e->lane[1 + a];
+                (void)ent;
+                pt_log_call(g_stream, 0, h->mod, h->fn, h->nid, args,
+                            g_ring->slot[s].lane[7]);
+                g_pending[idx].active = 0;
+            }
+        }
+        tail += 1;
+    }
+    g_ring->tail = tail;
+}
+
+static void *reader_thread(void *arg)
+{
+    (void)arg;
+    while (g_reader_run) {
+        reader_drain();
+        struct timespec ts = { 0, 2000000 };  /* 2 ms */
+        nanosleep(&ts, 0);
+    }
+    reader_drain();
+    return 0;
+}
+
+/* Remote page injection — the one piece of platform-firmware glue left.
+ * PT_SYSCTRL carries the remote-map request the payload wrappers expose.
+ * While it returns -1 the install runs in candidates-only mode and the
+ * trampolines are emitted and byte-checked but never armed. */
+static int inject_remote(pid_t pid, const void *local, size_t size, uint64_t *out_va)
+{
+    (void)pid;
+    (void)local;
+    (void)size;
+    (void)out_va;
+    return -1;
+}
+
+/* ---- public interface ------------------------------------------------ */
 
 int pt_hooks_install(pid_t pid, struct pt_stream *st)
 {
     g_stream = st;
     g_hook_count = 0;
+    g_ring = 0;
+    g_reader_run = 0;
 
-    /* module bases: dynlib handle walk — handle 0 (main executable) first,
-     * then the loaded PRX set. Platform glue: resolve the handle list via
-     * libkernel's dynlib iterator; until then we instrument the main
-     * executable only. */
-    uint64_t bases[MAX_MODULES] = { 0 };
+    /* module set: main executable first (M2.1 adds the loaded PRXs) */
+    uint64_t bases[MAX_MODULES];
     size_t nbases = 0;
-
-    uint64_t main_base = 0;  /* TODO(M2): from target's auxv/dynlink state */
+    uint64_t main_base = module_base(pid, 0);
     if (main_base)
         bases[nbases++] = main_base;
 
@@ -203,20 +288,89 @@ int pt_hooks_install(pid_t pid, struct pt_stream *st)
             return -1;
         }
 
-    printf("prosperotrace: %d hook candidates mapped (writes pending M2 trampoline emitter)\n",
-           g_hook_count);
+    if (g_hook_count == 0) {
+        printf("prosperotrace: no hook candidates\n");
+        return 0;
+    }
+
+    /* shared ring (agent side; mirrored into the target once glue lands) */
+    g_ring = mmap(0, RING_PAGES * 0x1000, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (g_ring == MAP_FAILED) {
+        g_ring = 0;
+        printf("prosperotrace: ring mmap failed\n");
+        return -1;
+    }
+    memset(g_ring, 0, RING_PAGES * 0x1000);
+
+    /* trampoline page */
+    size_t code_pages = (size_t)MAX_HOOKS * PT_TRAMPOLINE_MAX;
+    code_pages = (code_pages / 0x1000 + 1) * 0x1000;
+    uint8_t *code = mmap(0, code_pages, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (code == MAP_FAILED) {
+        printf("prosperotrace: code mmap failed\n");
+        munmap(g_ring, RING_PAGES * 0x1000);
+        g_ring = 0;
+        return -1;
+    }
+
+    uint64_t ring_tva = 0, code_tva = 0;
+    int has_tvm = (inject_remote(pid, g_ring, RING_PAGES * 0x1000, &ring_tva) == 0) &&
+                  (inject_remote(pid, code, code_pages, &code_tva) == 0);
+
+    size_t emitted = 0, armed = 0;
+    for (int i = 0; i < g_hook_count; i++) {
+        struct hook_rec *h = &g_hooks[i];
+        size_t len = 0;
+        h->code = code + (size_t)i * PT_TRAMPOLINE_MAX;
+        if (trampoline_emit(has_tvm ? ring_tva : (uint64_t)(uintptr_t)g_ring,
+                            h->original, (uint32_t)i,
+                            h->code, PT_TRAMPOLINE_MAX, &len) == 0) {
+            emitted++;
+            if (has_tvm) {
+                h->code_target = code_tva + (uint64_t)i * PT_TRAMPOLINE_MAX;
+                if (pt_write(pid, h->slot_addr, &h->code_target, 8) == 0) {
+                    h->patched = 1;
+                    armed++;
+                }
+            }
+        }
+    }
+
+    if (armed) {
+        g_reader_run = 1;
+        if (pthread_create(&g_reader, 0, reader_thread, 0) != 0)
+            g_reader_run = 0;
+    }
+
+    printf("prosperotrace: %d/%d slots emitted, %lu armed%s\n",
+           (int)emitted, g_hook_count, armed,
+           has_tvm ? "" : " (remote page injection glue pending — see docs/DESIGN.md)");
     return 0;
 }
 
 int pt_hooks_remove(pid_t pid)
 {
+    if (g_reader_run) {
+        g_reader_run = 0;
+        pthread_join(g_reader, 0);
+    }
     int rc = 0;
     for (int i = 0; i < g_hook_count; i++) {
-        uint64_t cur;
-        if (pt_read(pid, g_hooks[i].slot_addr, &cur, sizeof(cur)) == 0 &&
-            cur != g_hooks[i].original &&
-            pt_write(pid, g_hooks[i].slot_addr, &g_hooks[i].original, 8) != 0)
-            rc = -1;
+        if (g_hooks[i].patched) {
+            uint64_t cur;
+            if (pt_read(pid, g_hooks[i].slot_addr, &cur, sizeof(cur)) == 0 &&
+                cur != g_hooks[i].original &&
+                pt_write(pid, g_hooks[i].slot_addr, &g_hooks[i].original, 8) != 0)
+                rc = -1;
+            g_hooks[i].patched = 0;
+        }
+    }
+    memset(g_pending, 0, sizeof(g_pending));
+    if (g_ring) {
+        munmap(g_ring, RING_PAGES * 0x1000);
+        g_ring = 0;
     }
     g_hook_count = -1;
     g_stream = 0;

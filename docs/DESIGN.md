@@ -54,23 +54,34 @@ every process that maps the library. More moving parts; deferred.
 ## Event pipeline
 
 ```
-target ──GOT──▶ per-fn trampoline ──▶ shared stub
-                                        │  (capture args, call original
-                                        │   via saved slot, capture ret)
-                                        ▼
-                              SPSC ring buffer (64 KiB)
-                                        │  consumer thread (agent process)
-                                        ▼
-                              batched TCP ──▶ host receiver (JSONL)
+target ──GOT──▶ trampoline ──stores──▶ shared ring (in-target page)
+                                              │  reader thread (agent)
+                                              ▼
+                                       pt_log_call → agent SPSC ring
+                                              │  consumer thread
+                                              ▼
+                                 batched TCP ──▶ host receiver (JSONL)
 ```
 
-Backpressure policy: never block the target on I/O. If the ring is full the
-stub increments a drop counter; the consumer emits a `{"type":"drops"}` record.
-Losing events is always preferable to stalling the traced process.
+Two buffers by design:
 
-The stub runs with interrupts of the target thread intact and preserves all
-argument registers and the red zone; only the trampoline's own scratch
-registers are clobbered (see `agent/src/hook.c` for the exact contract).
+- **Shared ring** (target→agent). The trampolines write fixed-size events
+  (8×u64 lanes per event; entry and ret lane-groups) with plain stores, and
+  the agent reader drains from the same page. No locks — the target bumps
+  `head` per event pair and the reader never races past it. Layout in
+  `agent/src/ring.h`.
+- **Stream ring** (agent→socket). The existing SPSC ring in `stream.c`
+  batches events into TCP sends; this is where drops are counted and
+  reported as `{"type":"drops"}` records.
+
+Backpressure policy: never block the target on I/O. If the shared ring is
+full the trampoline skips the write — insertion is a single non-atomic
+`head` bump, so under heavy concurrency the tracer may lose a race rather
+than stall; per-thread slot reservation (seqlock-style) is M4.
+
+The trampolines are emitted by `agent/src/trampoline.c` from the canonical
+byte sequence in `tests/trampoline_ref.s`; `tests/check_trampoline.sh`
+asserts the two never drift.
 
 ## Identity of functions
 
@@ -91,6 +102,9 @@ NIDs are logged as `nid_0x…` so coverage gaps are visible in the output.
 ## Roadmap
 
 1. **M1** — streamer, ring buffer, process discovery, host receiver ✅
-2. **M2** — module enumeration in target + PLT/GOT hooking (current)
+2. **M2** — PLT/GOT hooks: trampoline emitter (byte-verified), shared-ring
+   transport with reader thread, candidate scan ✅ — remaining:
+   `PT_SYSCTRL` remote map glue and the GOT write-up on console
 3. **M3** — filter language (module/function globs), detach/reattach
-4. **M4** — inline-detour fallback; option to follow child processes
+4. **M4** — inline-detour fallback; per-thread pending events (seqlock); option
+   to follow child processes
