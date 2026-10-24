@@ -26,8 +26,8 @@ file I/O, heap churn, a worker thread) and diffs it against the stored
 baseline: ~650 calls over 21 functions in libkernel and libSceLibcInternal,
 0 dropped.
 
-- [x] host receiver, summarizer, diff, SQLite query layer, dashboard
-      ([prospero-analytics](https://github.com/rooklz/prospero-analytics))
+- [x] host receiver, summarizer, diff, SQLite query layer, dashboard, corpus
+      catalog, coverage/priority engine, parity (`analytics/`) — console-free
 - [x] NID table generator (`tools/nidgen.py`) — text list → C table
 - [x] agent: connect-out streaming with SPSC ring buffer + drop accounting
 - [x] agent: ptrace attach with debugger credentials, signal forwarding,
@@ -52,30 +52,28 @@ functions that return twice or never return (`setjmp`, `longjmp`, `exit`,
 ## Layout
 
 ```
-agent/    on-console tracer (C, ps5-payload-sdk) — streams events out over TCP
-tools/    build-time generators (NID table)
-docs/     design notes
-demo/     ptdemo, the fixture workload
-tests/    host-run checks (emitter bytes and execution, decoder, filter,
-          escaping, config) and the console fixture baseline
-tools/fixture.sh  trace ptdemo on a console and diff against the baseline
-deploy.sh pushes agent.elf to $PS5_IP:9021 (elfldr)
+agent/       on-console tracer (C, ps5-payload-sdk) — streams events out over TCP
+tools/       build-time generators (NID table) and the console fixture runner
+docs/        design notes
+demo/        ptdemo, the fixture workload
+tests/       host-run checks (emitter bytes and execution, decoder, filter,
+             escaping, config) and the console fixture baseline
+analytics/   host-side capture & analysis stack (see analytics/README.md)
+deploy.sh    pushes agent.elf to $PS5_IP:9021 (elfldr)
 ```
 
-The host-side capture and analysis tools (receiver, summarizer,
-API-surface diff) live in the separate
-**[rooklz/prospero-analytics](https://github.com/rooklz/prospero-analytics)**
-repo, which consumes only the JSONL event stream
-(`docs/EVENT_FORMAT.md` there).
+`analytics/` is the host-side half of the project — receiver, summarizer,
+API-surface diff, corpus catalog, coverage/priority engine, parity, SQLite
+layer, dashboard, and the agent↔host contract (`analytics/docs/EVENT_FORMAT.md`).
+It is deliberately console-free: it consumes only the JSONL event stream the
+agent produces.
 
 ## Quickstart (host side)
 
 ```sh
-git clone https://github.com/rooklz/prospero-analytics
-cd prospero-analytics
-python3 host/receiver.py --port 9029 --out traces/
-python3 host/summarize.py traces/trace-1234-*.jsonl
-python3 host/tracediff.py traces/before.jsonl traces/after.jsonl
+python3 analytics/host/receiver.py --port 9029 --out traces/
+python3 analytics/host/summarize.py traces/trace-1234-*.jsonl
+python3 analytics/host/tracediff.py traces/before.jsonl traces/after.jsonl
 ```
 
 ## Quickstart (agent)
@@ -100,19 +98,18 @@ connects out to the host, so the receiver must be listening first.
 ## Console fixture
 
 ```sh
-PS5_IP=192.168.10.192 HOST_IP=192.168.10.190 ANALYTICS=../prospero-analytics \
+PS5_IP=192.168.10.192 HOST_IP=192.168.10.190 \
 PS5_PAYLOAD_SDK=~/ps5-payload-sdk tools/fixture.sh            # diff vs baseline
 tools/fixture.sh --update                                      # re-record it
 ```
 
 Exits 1 if a function surfaced or disappeared compared to
 `tests/fixtures/ptdemo-baseline.jsonl`; rate changes are printed per 1000
-calls. Every capture is also validated against prospero-analytics'
-`docs/EVENT_FORMAT.md`, so a format change on either side fails the
-fixture. `.github/workflows/fixture.yml` runs it on the self-hosted `ps5`
-runner and publishes the capture, its `tracedb` database and the dashboard
-as the `fixture` artifact. For tracing anything else, see the end-to-end
-guide: [prospero-analytics/docs/GUIDE.md](https://github.com/rooklz/prospero-analytics/blob/main/docs/GUIDE.md).
+calls. Every capture is also validated against `analytics/docs/EVENT_FORMAT.md`,
+so a format change on either side fails the fixture. `.github/workflows/fixture.yml`
+runs it on the self-hosted `ps5` runner and publishes the capture, its
+`tracedb` database and the dashboard as the `fixture` artifact. For tracing
+anything else, see the end-to-end guide: `analytics/docs/GUIDE.md`.
 
 ## Event format
 

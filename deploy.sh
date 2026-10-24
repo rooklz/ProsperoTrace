@@ -3,7 +3,8 @@
 #
 # elfldr starts payloads without arguments or environment, so the agent
 # reads /data/prosperotrace.conf (see the README); upload it first. Start
-# the receiver before deploying: the agent connects out to it.
+# the receiver before deploying (the agent connects out to it):
+#   python3 analytics/host/receiver.py --port 9029 --out traces/
 #
 #   PS5_IP=192.168.10.192 ./deploy.sh build/prosperotrace.elf
 set -eu

@@ -2,13 +2,13 @@
 # fixture.sh — trace the ptdemo fixture on a console and diff it against the
 # stored baseline (tests/fixtures/ptdemo-baseline.jsonl).
 #
-#   PS5_IP=192.168.10.192 HOST_IP=192.168.10.190 \
-#   ANALYTICS=../prospero-analytics tools/fixture.sh [--update]
+#   PS5_IP=192.168.10.192 HOST_IP=192.168.10.190 tools/fixture.sh [--update]
+#   (host tooling defaults to this repo's analytics/; override with ANALYTICS)
 #
 # Needs: ps5-payload-sdk (PS5_PAYLOAD_SDK, or it is searched in common
 # locations), the console's elfldr on 9021 and its FTP server on 2121 (for
-# /data/prosperotrace.conf), and a checkout of rooklz/prospero-analytics
-# for the receiver and tracediff. An LLVM toolchain (Homebrew llvm is
+# /data/prosperotrace.conf). The receiver and tracediff come from
+# analytics/ in this repository. An LLVM toolchain (Homebrew llvm is
 # found automatically) is needed to build the agent and ptdemo.
 #
 # Each capture is checked against prospero-analytics' EVENT_FORMAT.md
@@ -24,7 +24,8 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 PS5_IP="${PS5_IP:?set PS5_IP to the console address}"
 HOST_IP="${HOST_IP:?set HOST_IP to the address the console uses to reach this host}"
-ANALYTICS="${ANALYTICS:?set ANALYTICS to a prospero-analytics checkout}"
+ANALYTICS="${ANALYTICS:-$ROOT/analytics}"
+[ -d "$ANALYTICS/host" ] || { echo "fixture: ANALYTICS=$ANALYTICS has no host/ (default is this repo's analytics/)" >&2; exit 2; }
 SDK="${PS5_PAYLOAD_SDK:-}"
 
 # Locate the payload SDK if the caller did not export PS5_PAYLOAD_SDK.

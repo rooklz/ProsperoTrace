@@ -11,16 +11,11 @@ jobs:
     runs-on: [self-hosted, ps5]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: rooklz/prospero-analytics
-          path: prospero-analytics
       - name: trace ptdemo and diff against the baseline
         env:
           PS5_IP: ${{ vars.PS5_IP }}
           HOST_IP: ${{ vars.HOST_IP }}
           PS5_PAYLOAD_SDK: ${{ vars.PS5_PAYLOAD_SDK }}
-          ANALYTICS: prospero-analytics
           FIXTURE_OUT: ${{ runner.temp }}
         run: tools/fixture.sh
       - uses: actions/upload-artifact@v4

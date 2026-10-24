@@ -11,3 +11,15 @@ jobs:
       - name: Rosetta (runs the x86-64 trampoline test on Apple silicon)
         run: softwareupdate --install-rosetta --agree-to-license || true
       - run: tests/run.sh
+  analytics-checks:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: analytics/tests/run.sh
